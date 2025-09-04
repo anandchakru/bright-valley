@@ -1,0 +1,129 @@
+databaseChangeLog:
+  - changeSet:
+      id: 001-create-deep-valley-user-table
+      author: system
+      comment: Create deep-valley user table with default and user-specific fields
+      changes:
+        - createTable:
+            schemaName: deep-valley
+            tableName: deep-valley_user
+            columns:
+              # Default system fields
+              - column:
+                  name: id
+                  type: bigserial
+                  constraints:
+                    nullable: false
+                    primaryKey: true
+                    primaryKeyName: pk_deep-valley_user_id
+                    generatedByDefault: true
+              - column:
+                  name: deleted
+                  type: boolean
+                  defaultValueBoolean: false
+              - column:
+                  name: delete_reason
+                  type: text
+              - column:
+                  name: tenant_id
+                  type: text
+              - column:
+                  name: created_at
+                  type: BIGINT
+                  defaultValueComputed: "EXTRACT(EPOCH FROM NOW()) * 1000"
+              - column:
+                  name: modified_at
+                  type: BIGINT
+                  defaultValueComputed: "EXTRACT(EPOCH FROM NOW()) * 1000"
+              - column:
+                  name: created_by
+                  type: text
+              - column:
+                  name: modified_by
+                  type: text
+              - column:
+                  name: slug
+                  type: text
+                  defaultValueComputed: "deep-valley.uuid_generate_v4()"
+                  constraints:
+                    nullable: false
+                    unique: true
+              # User-specific fields
+              - column:
+                  name: external_auth_provider
+                  type: text
+              - column:
+                  name: external_auth_id
+                  type: text
+              - column:
+                  name: picture
+                  type: text
+              - column:
+                  name: email
+                  type: text
+              - column:
+                  name: first_name
+                  type: text
+              - column:
+                  name: last_name
+                  type: text
+              - column:
+                  name: full_name
+                  type: text
+              - column:
+                  name: roles
+                  type: text
+                  remarks: "Comma-separated list of roles for RBAC"
+      rollback:
+        - dropTable:
+            schemaName: deep-valley
+            tableName: deep-valley_user
+
+  - changeSet:
+      id: 002-create-deep-valley-user-indexes
+      author: system
+      comment: Create indexes for deep-valley user table
+      changes:
+        - createIndex:
+            indexName: idx_deep-valley_user_email
+            schemaName: deep-valley
+            tableName: deep-valley_user
+            columns:
+              - column:
+                  name: email
+        - createIndex:
+            indexName: idx_deep-valley_user_external_auth
+            schemaName: deep-valley
+            tableName: deep-valley_user
+            columns:
+              - column:
+                  name: external_auth_provider
+              - column:
+                  name: external_auth_id
+        - createIndex:
+            indexName: idx_deep-valley_user_tenant
+            schemaName: deep-valley
+            tableName: deep-valley_user
+            columns:
+              - column:
+                  name: tenant_id
+        - createIndex:
+            indexName: idx_deep-valley_user_deleted
+            schemaName: deep-valley
+            tableName: deep-valley_user
+            columns:
+              - column:
+                  name: deleted
+      rollback:
+        - dropIndex:
+            indexName: idx_deep-valley_user_email
+            schemaName: deep-valley
+        - dropIndex:
+            indexName: idx_deep-valley_user_external_auth
+            schemaName: deep-valley
+        - dropIndex:
+            indexName: idx_deep-valley_user_tenant
+            schemaName: deep-valley
+        - dropIndex:
+            indexName: idx_deep-valley_user_deleted
+            schemaName: deep-valley
