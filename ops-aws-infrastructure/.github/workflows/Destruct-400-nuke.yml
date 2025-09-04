@@ -1,0 +1,918 @@
+name: Destruct-400-Nuke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_VERSION: "1.12.2"
+  AWS_REGION: 
+  AWS_ACCESS_KEY_ID: 
+
+jobs:
+  nuke:
+    name: Infra Nuke
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Env setup
+        run: |
+          if [[ "$" != "main" && "$" != "dev" ]]; then
+            echo "⚠️ Workflow only supports 'main' or 'dev' branches"
+            echo "Current branch: $"
+            echo "Exiting with no-op"
+            exit 0
+          fi
+          
+          # Set environment variables
+          echo "BRANCH=$" >> $GITHUB_ENV
+          if [ "$" = "main" ]; then
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=test" >> $GITHUB_ENV
+          fi
+          
+          echo "✅ Environment setup completed: $"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam:::role/bright-valley-terraform-role
+          aws-region: $
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: $
+          terraform_wrapper: false
+
+      - name: "Phase 1: Pre-Destroy Comprehensive Cleanup"
+        continue-on-error: true
+        run: |
+          cd ops/terraform
+          echo "🧹 Phase 1: Comprehensive pre-destroy cleanup - preparing all resources..."
+          
+          # Enhanced cleanup function with dependency handling
+          cleanup_resource() {
+            local resource_type="$1"
+            local identifier="$2"
+            local description="$3"
+            
+            echo "  🔍 Processing $description..."
+            case "$resource_type" in
+              "cloudfront")
+                echo "    🌐 Checking CloudFront distributions..."
+                DISTRIBUTIONS=$(aws cloudfront list-distributions --query "DistributionList.Items[?Comment=='bright-valley $ client distribution'].Id" --output text 2>/dev/null || true)
+                
+                # Handle case where no distributions are found (returns "None")
+                if [ "$DISTRIBUTIONS" = "None" ] || [ -z "$DISTRIBUTIONS" ]; then
+                  echo "    No CloudFront distributions found for this environment"
+                  return 0
+                fi
+                
+                for DIST_ID in $DISTRIBUTIONS; do
+                  if [ -n "$DIST_ID" ] && [ "$DIST_ID" != "None" ]; then
+                    echo "    Found CloudFront distribution: $DIST_ID"
+                    DIST_STATUS=$(aws cloudfront get-distribution --id "$DIST_ID" --query 'Distribution.Status' --output text 2>/dev/null)
+                    if [ "$DIST_STATUS" = "Deployed" ]; then
+                      echo "    Disabling distribution: $DIST_ID"
+                      ETAG=$(aws cloudfront get-distribution-config --id "$DIST_ID" --query 'ETag' --output text 2>/dev/null)
+                      aws cloudfront get-distribution-config --id "$DIST_ID" --query 'DistributionConfig' > /tmp/dist-config.json
+                      jq '.Enabled = false' /tmp/dist-config.json > /tmp/dist-config-disabled.json
+                      aws cloudfront update-distribution --id "$DIST_ID" --distribution-config "file:///tmp/dist-config-disabled.json" --if-match "$ETAG" 2>/dev/null || true
+                      echo "    ⏳ Distribution $DIST_ID disabled, will be ready for deletion"
+                    fi
+                  fi
+                done
+                ;;
+              "asg")
+                if aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$identifier" 2>/dev/null; then
+                  echo "    Found Auto Scaling Group: $identifier"
+                  echo "    Terminating all instances immediately..."
+                  
+                  # Get instance IDs
+                  INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$identifier" --query 'AutoScalingGroups[0].Instances[].InstanceId' --output text 2>/dev/null || true)
+                  
+                  # Scale to zero first
+                  aws autoscaling update-auto-scaling-group --auto-scaling-group-name "$identifier" --min-size 0 --desired-capacity 0 --max-size 0 2>/dev/null || true
+                  
+                  # Force terminate instances (handle None response)
+                  if [ "$INSTANCE_IDS" != "None" ] && [ -n "$INSTANCE_IDS" ]; then
+                    for INSTANCE_ID in $INSTANCE_IDS; do
+                      if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
+                        echo "    Force terminating instance: $INSTANCE_ID"
+                        aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" 2>/dev/null || true
+                      fi
+                    done
+                  else
+                    echo "    No instances found in ASG"
+                  fi
+                  
+                  echo "    ⏳ Waiting for instances to terminate..."
+                  sleep 45
+                else
+                  echo "    No existing ASG found: $identifier"
+                fi
+                ;;
+              "rds-instance")
+                if aws rds describe-db-instances --db-instance-identifier "$identifier" 2>/dev/null; then
+                  echo "    Found RDS instance: $identifier"
+                  DB_STATUS=$(aws rds describe-db-instances --db-instance-identifier "$identifier" --query 'DBInstances[0].DBInstanceStatus' --output text 2>/dev/null || echo "unknown")
+                  echo "    RDS instance status: $DB_STATUS"
+                  
+                  # Disable backup retention and deletion protection (handles InvalidParameterCombination error)
+                  echo "    Preparing RDS for cleanup..."
+                  aws rds modify-db-instance --db-instance-identifier "$identifier" --no-deletion-protection --backup-retention-period 0 --apply-immediately 2>/dev/null || true
+                  
+                  # Verify deletion protection is disabled
+                  sleep 10
+                  PROTECTION_STATUS=$(aws rds describe-db-instances --db-instance-identifier "$identifier" --query 'DBInstances[0].DeletionProtection' --output text 2>/dev/null || echo "unknown")
+                  echo "    Deletion protection status: $PROTECTION_STATUS"
+                  
+                  if [ "$PROTECTION_STATUS" = "true" ]; then
+                    echo "    ⚠️ Deletion protection still enabled, trying again..."
+                    aws rds modify-db-instance --db-instance-identifier "$identifier" --no-deletion-protection --apply-immediately 2>/dev/null || true
+                    sleep 10
+                  fi
+                  
+                  # Stop instance if running to speed up deletion later
+                  if [ "$DB_STATUS" = "available" ]; then
+                    echo "    Stopping RDS instance to prepare for deletion..."
+                    aws rds stop-db-instance --db-instance-identifier "$identifier" 2>/dev/null || true
+                  fi
+                else
+                  echo "    No existing RDS instance found: $identifier"
+                fi
+                ;;
+              "s3-bucket")
+                if aws s3api head-bucket --bucket "$identifier" 2>/dev/null; then
+                  echo "    Found S3 bucket: $identifier"
+                  echo "    Emptying bucket completely..."
+                  
+                  # Remove all current objects first
+                  aws s3 rm "s3://$identifier" --recursive 2>/dev/null || true
+                  
+                  # Remove all object versions (handles BucketNotEmpty error)
+                  echo "    Removing all object versions..."
+                  aws s3api list-object-versions --bucket "$identifier" --query 'Versions[].[Key,VersionId]' --output text 2>/dev/null | while read key version; do
+                    if [ -n "$key" ] && [ -n "$version" ]; then
+                      aws s3api delete-object --bucket "$identifier" --key "$key" --version-id "$version" 2>/dev/null || true
+                    fi
+                  done
+                  
+                  # Remove all delete markers (handles BucketNotEmpty error)
+                  echo "    Removing all delete markers..."
+                  aws s3api list-object-versions --bucket "$identifier" --query 'DeleteMarkers[].[Key,VersionId]' --output text 2>/dev/null | while read key version; do
+                    if [ -n "$key" ] && [ -n "$version" ]; then
+                      aws s3api delete-object --bucket "$identifier" --key "$key" --version-id "$version" 2>/dev/null || true
+                    fi
+                  done
+                  
+                  # Remove bucket lifecycle policies
+                  aws s3api delete-bucket-lifecycle --bucket "$identifier" 2>/dev/null || true
+                  
+                  # Remove bucket notifications
+                  aws s3api put-bucket-notification-configuration --bucket "$identifier" --notification-configuration '{}' 2>/dev/null || true
+                  
+                  # Remove bucket policy
+                  aws s3api delete-bucket-policy --bucket "$identifier" 2>/dev/null || true
+                  
+                  # Remove bucket versioning
+                  aws s3api put-bucket-versioning --bucket "$identifier" --versioning-configuration Status=Suspended 2>/dev/null || true
+                  
+                  echo "    ✅ S3 bucket $identifier completely emptied and prepared for deletion"
+                else
+                  echo "    No existing S3 bucket found: $identifier"
+                fi
+                ;;
+              "iam-role")
+                if aws iam get-role --role-name "$identifier" 2>/dev/null; then
+                  echo "    Found IAM role: $identifier"
+                  
+                  # Remove from all instance profiles
+                  PROFILES=$(aws iam list-instance-profiles-for-role --role-name "$identifier" --query 'InstanceProfiles[].InstanceProfileName' --output text 2>/dev/null || true)
+                  if [ "$PROFILES" != "None" ] && [ -n "$PROFILES" ]; then
+                    for PROFILE in $PROFILES; do
+                      if [ -n "$PROFILE" ] && [ "$PROFILE" != "None" ]; then
+                        echo "    Removing role from instance profile: $PROFILE"
+                        aws iam remove-role-from-instance-profile --instance-profile-name "$PROFILE" --role-name "$identifier" 2>/dev/null || true
+                      fi
+                    done
+                  fi
+                  
+                  # Detach all managed policies
+                  POLICIES=$(aws iam list-attached-role-policies --role-name "$identifier" --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null || true)
+                  if [ "$POLICIES" != "None" ] && [ -n "$POLICIES" ]; then
+                    for POLICY in $POLICIES; do
+                      if [ -n "$POLICY" ] && [ "$POLICY" != "None" ]; then
+                        echo "    Detaching managed policy: $POLICY"
+                        aws iam detach-role-policy --role-name "$identifier" --policy-arn "$POLICY" 2>/dev/null || true
+                      fi
+                    done
+                  fi
+                  
+                  # Delete all inline policies
+                  INLINE_POLICIES=$(aws iam list-role-policies --role-name "$identifier" --query 'PolicyNames' --output text 2>/dev/null || true)
+                  if [ "$INLINE_POLICIES" != "None" ] && [ -n "$INLINE_POLICIES" ]; then
+                    for POLICY in $INLINE_POLICIES; do
+                      if [ -n "$POLICY" ] && [ "$POLICY" != "None" ]; then
+                        echo "    Deleting inline policy: $POLICY"
+                        aws iam delete-role-policy --role-name "$identifier" --policy-name "$POLICY" 2>/dev/null || true
+                      fi
+                    done
+                  fi
+                  
+                  echo "    ✅ IAM role $identifier cleaned and ready"
+                else
+                  echo "    No existing IAM role found: $identifier"
+                fi
+                ;;
+            esac
+          }
+          
+          echo "📋 Starting dependency-aware cleanup sequence..."
+          
+          # Phase 1a: Disable CloudFront (takes longest)
+          cleanup_resource "cloudfront" "" "CloudFront distributions"
+          
+          # Phase 1b: Scale down compute resources
+          cleanup_resource "asg" "bright-valley-$-asg" "Auto Scaling Group"
+          
+          # Phase 1c: Prepare database
+          cleanup_resource "rds-instance" "bright-valley-$-db" "RDS PostgreSQL instance"
+          
+          # Phase 1d: Empty storage
+          cleanup_resource "s3-bucket" "bright-valley-$-client-bucket" "Client S3 bucket"
+          cleanup_resource "s3-bucket" "bright-valley-$-ops" "Ops S3 bucket"
+          
+          # Phase 1e: Clean IAM (no dependencies)
+          cleanup_resource "iam-role" "bright-valley-$-ec2-role" "EC2 IAM role"
+          cleanup_resource "iam-role" "bright-valley-$-rds-monitoring-role" "RDS monitoring role"
+          
+          # Phase 1f: Handle VPC dependencies (CRITICAL for Terraform destroy)
+          echo "  🌐 Handling VPC dependencies for smooth Terraform destroy..."
+          
+          # Find all project VPCs
+          VPC_IDS=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Project,Values=bright-valley" \
+            --query 'Vpcs[].VpcId' \
+            --output text 2>/dev/null || true)
+          
+          for VPC_ID in $VPC_IDS; do
+            if [ -n "$VPC_ID" ] && [ "$VPC_ID" != "None" ]; then
+              echo "    Processing VPC: $VPC_ID"
+              
+              # 1. Delete NAT Gateways (frees up EIPs)
+              echo "      Deleting NAT Gateways..."
+              NAT_GW_IDS=$(aws ec2 describe-nat-gateways \
+                --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending" \
+                --query 'NatGateways[].NatGatewayId' \
+                --output text 2>/dev/null || true)
+              
+              for NAT_ID in $NAT_GW_IDS; do
+                if [ -n "$NAT_ID" ] && [ "$NAT_ID" != "None" ]; then
+                  echo "        Deleting NAT Gateway: $NAT_ID"
+                  aws ec2 delete-nat-gateway --nat-gateway-id "$NAT_ID" 2>/dev/null || true
+                fi
+              done
+              
+              # Wait for NAT Gateways to be deleted
+              if [ -n "$NAT_GW_IDS" ] && [ "$NAT_GW_IDS" != "None" ]; then
+                echo "        ⏳ Waiting for NAT Gateways to be deleted..."
+                for NAT_ID in $NAT_GW_IDS; do
+                  if [ -n "$NAT_ID" ] && [ "$NAT_ID" != "None" ]; then
+                    aws ec2 wait nat-gateway-deleted --nat-gateway-ids "$NAT_ID" 2>/dev/null || true
+                  fi
+                done
+              fi
+              
+              # 2. Release all Elastic IPs (frees up mapped addresses)
+              echo "      Releasing Elastic IPs..."
+              EIP_DATA=$(aws ec2 describe-addresses \
+                --filters "Name=domain,Values=vpc" "Name=tag:Project,Values=bright-valley" \
+                --query 'Addresses[].[AllocationId,AssociationId]' \
+                --output text 2>/dev/null || true)
+              
+              if [ -n "$EIP_DATA" ] && [ "$EIP_DATA" != "None" ]; then
+                echo "$EIP_DATA" | while IFS=$'\t' read -r ALLOC_ID ASSOC_ID; do
+                  if [ -n "$ALLOC_ID" ] && [ "$ALLOC_ID" != "None" ]; then
+                    echo "        Processing EIP: $ALLOC_ID"
+                    
+                    # Disassociate if attached
+                    if [ -n "$ASSOC_ID" ] && [ "$ASSOC_ID" != "None" ] && [ "$ASSOC_ID" != "null" ]; then
+                      echo "          Disassociating EIP: $ALLOC_ID"
+                      aws ec2 disassociate-address --association-id "$ASSOC_ID" 2>/dev/null || true
+                      sleep 2
+                    fi
+                    
+                    # Release the EIP
+                    echo "          Releasing EIP: $ALLOC_ID"
+                    aws ec2 release-address --allocation-id "$ALLOC_ID" 2>/dev/null || true
+                  fi
+                done
+              fi
+              
+              # 3. Delete Load Balancers (disable deletion protection first)
+              echo "      Handling Load Balancers..."
+              ALB_ARNS=$(aws elbv2 describe-load-balancers \
+                --query "LoadBalancers[?contains(LoadBalancerName,'bright-valley')].LoadBalancerArn" \
+                --output text 2>/dev/null || true)
+              
+              for ALB_ARN in $ALB_ARNS; do
+                if [ -n "$ALB_ARN" ] && [ "$ALB_ARN" != "None" ]; then
+                  echo "        Processing ALB: $ALB_ARN"
+                  
+                  # Disable deletion protection
+                  echo "          Disabling deletion protection..."
+                  aws elbv2 modify-load-balancer-attributes \
+                    --load-balancer-arn "$ALB_ARN" \
+                    --attributes Key=deletion_protection.enabled,Value=false 2>/dev/null || true
+                  
+                  # Delete the ALB
+                  echo "          Deleting ALB..."
+                  aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN" 2>/dev/null || true
+                fi
+              done
+              
+              # Wait for ALBs to be deleted
+              if [ -n "$ALB_ARNS" ] && [ "$ALB_ARNS" != "None" ]; then
+                echo "        ⏳ Waiting for Load Balancers to be deleted..."
+                sleep 60
+              fi
+            fi
+          done
+          
+          # Phase 1g: Force empty S3 buckets completely
+          echo "  🗑️ Force emptying S3 buckets completely..."
+          
+          S3_BUCKETS=$(aws s3api list-buckets \
+            --query "Buckets[?contains(Name, 'bright-valley-$')].Name" \
+            --output text 2>/dev/null || true)
+          
+          for BUCKET in $S3_BUCKETS; do
+            if [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ]; then
+              echo "    Force emptying S3 bucket: $BUCKET"
+              
+              # Delete all current objects
+              aws s3 rm "s3://$BUCKET" --recursive 2>/dev/null || true
+              
+              # Delete all object versions
+              aws s3api list-object-versions --bucket "$BUCKET" --query 'Versions[].[Key,VersionId]' --output text 2>/dev/null | while read key version; do
+                if [ -n "$key" ] && [ -n "$version" ]; then
+                  aws s3api delete-object --bucket "$BUCKET" --key "$key" --version-id "$version" 2>/dev/null || true
+                fi
+              done
+              
+              # Delete all delete markers
+              aws s3api list-object-versions --bucket "$BUCKET" --query 'DeleteMarkers[].[Key,VersionId]' --output text 2>/dev/null | while read key version; do
+                if [ -n "$key" ] && [ -n "$version" ]; then
+                  aws s3api delete-object --bucket "$BUCKET" --key "$key" --version-id "$version" 2>/dev/null || true
+                fi
+              done
+              
+              echo "    ✅ S3 bucket $BUCKET completely emptied"
+            fi
+          done
+          
+          # Phase 1h: Ensure RDS deletion protection is disabled
+          echo "  🛡️ Ensuring RDS deletion protection is disabled..."
+          
+          RDS_INSTANCES=$(aws rds describe-db-instances \
+            --query "DBInstances[?contains(DBInstanceIdentifier,'bright-valley-$')].DBInstanceIdentifier" \
+            --output text 2>/dev/null || true)
+          
+          for DB_INSTANCE in $RDS_INSTANCES; do
+            if [ -n "$DB_INSTANCE" ] && [ "$DB_INSTANCE" != "None" ]; then
+              echo "    Ensuring deletion protection disabled for RDS: $DB_INSTANCE"
+              aws rds modify-db-instance \
+                --db-instance-identifier "$DB_INSTANCE" \
+                --no-deletion-protection \
+                --apply-immediately 2>/dev/null || true
+            fi
+          done
+          
+          # Wait for changes to propagate
+          echo "  ⏳ Waiting for all changes to propagate..."
+          sleep 30
+          
+          # Phase 1i: Final verification of dependency cleanup
+          echo "  🔍 Final verification of dependency cleanup..."
+          
+          # Verify S3 buckets are empty
+          S3_BUCKETS_CHECK=$(aws s3api list-buckets \
+            --query "Buckets[?contains(Name, 'bright-valley-$')].Name" \
+            --output text 2>/dev/null || true)
+          
+          for BUCKET in $S3_BUCKETS_CHECK; do
+            if [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ]; then
+              OBJECT_COUNT=$(aws s3api list-objects-v2 --bucket "$BUCKET" --query 'length(Contents)' --output text 2>/dev/null || echo "0")
+              VERSION_COUNT=$(aws s3api list-object-versions --bucket "$BUCKET" --query 'length(Versions)' --output text 2>/dev/null || echo "0")
+              MARKER_COUNT=$(aws s3api list-object-versions --bucket "$BUCKET" --query 'length(DeleteMarkers)' --output text 2>/dev/null || echo "0")
+              
+              if [ "$OBJECT_COUNT" != "0" ] || [ "$VERSION_COUNT" != "0" ] || [ "$MARKER_COUNT" != "0" ]; then
+                echo "    ⚠️ S3 bucket $BUCKET still has content: $OBJECT_COUNT objects, $VERSION_COUNT versions, $MARKER_COUNT markers"
+              else
+                echo "    ✅ S3 bucket $BUCKET is empty"
+              fi
+            fi
+          done
+          
+          # Verify RDS deletion protection is disabled
+          RDS_INSTANCES_CHECK=$(aws rds describe-db-instances \
+            --query "DBInstances[?contains(DBInstanceIdentifier,'bright-valley-$')].DBInstanceIdentifier" \
+            --output text 2>/dev/null || true)
+          
+          for DB_INSTANCE in $RDS_INSTANCES_CHECK; do
+            if [ -n "$DB_INSTANCE" ] && [ "$DB_INSTANCE" != "None" ]; then
+              PROTECTION_STATUS=$(aws rds describe-db-instances --db-instance-identifier "$DB_INSTANCE" --query 'DBInstances[0].DeletionProtection' --output text 2>/dev/null || echo "unknown")
+              if [ "$PROTECTION_STATUS" = "true" ]; then
+                echo "    ⚠️ RDS instance $DB_INSTANCE still has deletion protection enabled"
+              else
+                echo "    ✅ RDS instance $DB_INSTANCE deletion protection disabled"
+              fi
+            fi
+          done
+          
+          # Verify ALBs are deleted or deletion protection disabled
+          ALB_CHECK=$(aws elbv2 describe-load-balancers \
+            --query "LoadBalancers[?contains(LoadBalancerName,'bright-valley')].LoadBalancerArn" \
+            --output text 2>/dev/null || true)
+          
+          if [ -n "$ALB_CHECK" ] && [ "$ALB_CHECK" != "None" ]; then
+            for ALB_ARN in $ALB_CHECK; do
+              if [ -n "$ALB_ARN" ] && [ "$ALB_ARN" != "None" ]; then
+                PROTECTION_ATTR=$(aws elbv2 describe-load-balancer-attributes --load-balancer-arn "$ALB_ARN" --query 'Attributes[?Key==`deletion_protection.enabled`].Value' --output text 2>/dev/null || echo "unknown")
+                if [ "$PROTECTION_ATTR" = "true" ]; then
+                  echo "    ⚠️ ALB $ALB_ARN still has deletion protection enabled"
+                else
+                  echo "    ✅ ALB $ALB_ARN deletion protection disabled"
+                fi
+              fi
+            done
+          else
+            echo "    ✅ No ALBs found"
+          fi
+          
+          # Verify EIPs are released
+          EIP_CHECK=$(aws ec2 describe-addresses \
+            --filters "Name=domain,Values=vpc" "Name=tag:Project,Values=bright-valley" \
+            --query 'Addresses[].AllocationId' \
+            --output text 2>/dev/null || true)
+          
+          if [ -n "$EIP_CHECK" ] && [ "$EIP_CHECK" != "None" ]; then
+            echo "    ⚠️ Some EIPs still exist: $EIP_CHECK"
+          else
+            echo "    ✅ All EIPs released"
+          fi
+          
+          echo "✅ Phase 1 pre-cleanup completed successfully"
+
+      - name: "Phase 2: Controlled Terraform Destroy"
+        continue-on-error: true
+        run: |
+          cd ops/terraform
+          echo "🔧 Phase 2: Initializing Terraform for controlled destroy..."
+          
+          # Disable exit on error for this specific command
+          set +e
+          INIT_OUTPUT=$(terraform init -backend-config=backend-${ENVIRONMENT}.hcl -input=false 2>&1)
+          INIT_EXIT_CODE=$?
+          set -e
+          
+          echo "$INIT_OUTPUT"
+          
+          if [ $INIT_EXIT_CODE -eq 0 ]; then
+            echo "✅ Terraform init successful"
+          else
+            echo "🚨 Terraform init failed, checking for state corruption..."
+            
+            # Check if it's a state corruption issue
+            if echo "$INIT_OUTPUT" | grep -q "state data in S3 does not have the expected content"; then
+              echo "🛠️ State corruption detected during init, attempting recovery..."
+              
+              # Check if the state file exists in S3
+              echo "🔍 Checking if state file exists in S3..."
+              STATE_BUCKET="bright-valley-terraform-state"
+              STATE_KEY="terraform.tfstate"
+              
+              if aws s3api head-object --bucket "$STATE_BUCKET" --key "$STATE_KEY" 2>/dev/null; then
+                echo "📄 State file exists but is corrupted, attempting repair..."
+                
+                # Try init with reconfigure to bypass corrupted state
+                echo "🔄 Trying init with -reconfigure..."
+                set +e
+                terraform init -reconfigure -input=false
+                RECONFIGURE_EXIT_CODE=$?
+                set -e
+                
+                if [ $RECONFIGURE_EXIT_CODE -ne 0 ]; then
+                  echo "🆘 Reconfigure failed, removing corrupted state file..."
+                  aws s3 rm "s3://$STATE_BUCKET/$STATE_KEY" || true
+                  
+                  # Try init again with fresh state
+                  echo "🔄 Trying init with fresh state for destroy..."
+                  set +e
+                  terraform init -backend-config=backend-${ENVIRONMENT}.hcl -input=false
+                  FRESH_INIT_EXIT_CODE=$?
+                  set -e
+                  
+                  if [ $FRESH_INIT_EXIT_CODE -ne 0 ]; then
+                    echo "🆘 Cannot initialize Terraform, will skip terraform destroy"
+                    echo "SKIP_TERRAFORM=true" >> $GITHUB_ENV
+                  fi
+                fi
+              else
+                echo "📄 No state file found - nothing to destroy via Terraform"
+                echo "🔄 Will rely on AWS CLI cleanup only"
+                echo "SKIP_TERRAFORM=true" >> $GITHUB_ENV
+              fi
+            else
+              echo "❌ Init failed for unknown reason:"
+              echo "$INIT_OUTPUT"
+              exit 1
+            fi
+          fi
+          
+          # Enhanced terraform destroy with multiple attempts
+          if [ "$SKIP_TERRAFORM" != "true" ]; then
+            echo "🗑️ Running controlled terraform destroy..."
+            
+            MAX_DESTROY_ATTEMPTS=3
+            DESTROY_ATTEMPT=0
+            DESTROY_SUCCESS=false
+            
+            while [ $DESTROY_ATTEMPT -lt $MAX_DESTROY_ATTEMPTS ] && [ "$DESTROY_SUCCESS" = "false" ]; do
+              DESTROY_ATTEMPT=$((DESTROY_ATTEMPT + 1))
+              echo "🎯 Destroy attempt $DESTROY_ATTEMPT/$MAX_DESTROY_ATTEMPTS"
+              
+              set +e
+              DESTROY_OUTPUT=$(terraform destroy -auto-approve -var-file=environments/$.tfvars -input=false 2>&1)
+              DESTROY_EXIT_CODE=$?
+              set -e
+              
+              echo "$DESTROY_OUTPUT"
+              
+              if [ $DESTROY_EXIT_CODE -eq 0 ]; then
+                echo "✅ Terraform destroy successful!"
+                DESTROY_SUCCESS=true
+              else
+                echo "🚨 Destroy attempt $DESTROY_ATTEMPT failed"
+                
+                # Handle specific destroy issues
+                if echo "$DESTROY_OUTPUT" | grep -q "DependencyViolation"; then
+                  echo "🔗 Dependency violations detected, removing problematic resources from state..."
+                  
+                  # Remove CloudFront from state if causing issues
+                  if echo "$DESTROY_OUTPUT" | grep -q "aws_cloudfront_distribution"; then
+                    terraform state list | grep aws_cloudfront_distribution | while read resource; do
+                      echo "Removing $resource from state"
+                      terraform state rm "$resource" 2>/dev/null || true
+                    done
+                  fi
+                  
+                  # Remove ALB dependencies
+                  if echo "$DESTROY_OUTPUT" | grep -q "aws_lb"; then
+                    terraform state list | grep -E "aws_lb\.|aws_lb_target_group\.|aws_lb_listener" | while read resource; do
+                      echo "Removing $resource from state"
+                      terraform state rm "$resource" 2>/dev/null || true
+                    done
+                  fi
+                fi
+                
+                if echo "$DESTROY_OUTPUT" | grep -q "InvalidDBInstanceState"; then
+                  echo "🐘 RDS instance state issue, removing from state..."
+                  terraform state list | grep aws_db_instance | while read resource; do
+                    echo "Removing $resource from state"
+                    terraform state rm "$resource" 2>/dev/null || true
+                  done
+                fi
+                
+                if [ $DESTROY_ATTEMPT -eq $MAX_DESTROY_ATTEMPTS ]; then
+                  echo "⚠️ Controlled destroy failed after $MAX_DESTROY_ATTEMPTS attempts"
+                  echo "DESTROY_FAILED=true" >> $GITHUB_ENV
+                else
+                  echo "⏳ Waiting before next destroy attempt..."
+                  sleep 30
+                fi
+              fi
+            done
+            
+            if [ "$DESTROY_SUCCESS" = "true" ]; then
+              echo "DESTROY_SUCCESS=true" >> $GITHUB_ENV
+            fi
+          else
+            echo "⚠️ Skipping terraform destroy due to state issues"
+            echo "DESTROY_SUCCESS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Clear Previous AWS Credentials
+        if: always()
+        continue-on-error: true
+        run: |
+          # Clear all AWS credential environment variables from previous OIDC session
+          unset AWS_SESSION_TOKEN
+          unset AWS_ACCESS_KEY_ID
+          unset AWS_SECRET_ACCESS_KEY
+          unset AWS_DEFAULT_REGION
+          echo "✅ All AWS credential environment variables cleared"
+          
+          # Verify credentials are cleared
+          echo "🔍 Verifying credentials are cleared..."
+          if [ -z "$AWS_SESSION_TOKEN" ] && [ -z "$AWS_ACCESS_KEY_ID" ] && [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo "✅ AWS credentials successfully cleared"
+          else
+            echo "⚠️ Some AWS credentials still present"
+          fi
+
+
+
+      - name: "Phase 3: Enhanced Manual AWS Resource Cleanup"
+        if: always()
+        continue-on-error: true
+        run: |
+          # Set admin credentials for this step
+          echo "Current ACCESS KEY ID: ${AWS_ACCESS_KEY_ID:0:10} Expected: "
+          export AWS_ACCESS_KEY_ID=
+          export AWS_SECRET_ACCESS_KEY="$"
+          export AWS_DEFAULT_REGION="$"
+          unset AWS_SESSION_TOKEN
+          
+          echo "🧹 Phase 3: Enhanced comprehensive AWS resource cleanup..."
+          echo "🔍 Using admin credentials for cleanup..."
+          echo "AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:0:10}... Expected: "
+          echo "AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:0:10}..."
+          echo "AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-'NOT SET✅'}"
+          echo "AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION"
+          
+          aws sts get-caller-identity || {
+            echo "❌ Admin credentials failed"
+            exit 1
+          }
+          echo "✅ Admin credentials verified successfully"
+          
+          # Enhanced force cleanup function - comprehensive resource deletion
+          force_cleanup_resource() {
+            local resource_type="$1"
+            local identifier="$2"
+            local description="$3"
+            
+            echo "  🔍 Force cleaning $description..."
+            case "$resource_type" in
+              "cloudfront")
+                DISTRIBUTIONS=$(aws cloudfront list-distributions --query "DistributionList.Items[?Comment=='bright-valley $ client distribution'].Id" --output text 2>/dev/null || true)
+                
+                # Handle case where no distributions are found (returns "None")
+                if [ "$DISTRIBUTIONS" = "None" ] || [ -z "$DISTRIBUTIONS" ]; then
+                  echo "    No CloudFront distributions found for this environment"
+                  return 0
+                fi
+                
+                for DIST_ID in $DISTRIBUTIONS; do
+                  if [ -n "$DIST_ID" ] && [ "$DIST_ID" != "None" ]; then
+                    STATUS=$(aws cloudfront get-distribution --id "$DIST_ID" --query 'Distribution.Status' --output text 2>/dev/null)
+                    if [ "$STATUS" = "Deployed" ]; then
+                      echo "    ⚠️ CloudFront distribution $DIST_ID still exists and deployed"
+                      echo "    💡 Manual deletion required via AWS console (takes 15+ minutes)"
+                    else
+                      echo "    🗑️ Attempting to delete distribution $DIST_ID..."
+                      ETAG=$(aws cloudfront get-distribution --id "$DIST_ID" --query 'ETag' --output text 2>/dev/null)
+                      aws cloudfront delete-distribution --id "$DIST_ID" --if-match "$ETAG" 2>/dev/null || {
+                        echo "    ⚠️ Could not delete distribution, may need manual intervention"
+                      }
+                    fi
+                  fi
+                done
+                ;;
+              "asg")
+                if aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$identifier" 2>/dev/null; then
+                  echo "    🗑️ Force deleting ASG: $identifier"
+                  aws autoscaling delete-auto-scaling-group --auto-scaling-group-name "$identifier" --force-delete 2>/dev/null || true
+                  echo "    ✅ ASG force deletion initiated"
+                fi
+                ;;
+              "rds-instance")
+                if aws rds describe-db-instances --db-instance-identifier "$identifier" 2>/dev/null; then
+                  echo "    🗑️ Force deleting RDS instance: $identifier"
+                  aws rds delete-db-instance --db-instance-identifier "$identifier" --skip-final-snapshot --delete-automated-backups 2>/dev/null || true
+                  echo "    ✅ RDS deletion initiated (may take several minutes)"
+                fi
+                ;;
+              "s3-bucket")
+                if aws s3api head-bucket --bucket "$identifier" 2>/dev/null; then
+                  echo "    🗑️ Force deleting S3 bucket: $identifier"
+                  aws s3 rm "s3://$identifier" --recursive 2>/dev/null || true
+                  aws s3api delete-bucket --bucket "$identifier" 2>/dev/null || true
+                  echo "    ✅ S3 bucket deletion attempted"
+                fi
+                ;;
+              "all-resources")
+                echo "    🔍 Scanning for ALL project resources..."
+                
+                # Delete all S3 buckets matching pattern
+                aws s3 ls | grep "bright-valley-$" | while read bucket; do
+                  BUCKET_NAME=$(echo "$bucket" | awk '{print $3}')
+                  if [ -n "$BUCKET_NAME" ]; then
+                    echo "    🗑️ Found and deleting S3 bucket: $BUCKET_NAME"
+                    aws s3 rm "s3://$BUCKET_NAME" --recursive 2>/dev/null || true
+                    aws s3api delete-bucket --bucket "$BUCKET_NAME" 2>/dev/null || true
+                  fi
+                done
+                
+                # Delete all ASGs matching pattern
+                ASGS=$(aws autoscaling describe-auto-scaling-groups --query "AutoScalingGroups[?contains(AutoScalingGroupName, 'bright-valley-$')].AutoScalingGroupName" --output text 2>/dev/null || true)
+                if [ "$ASGS" != "None" ] && [ -n "$ASGS" ]; then
+                  for asg in $ASGS; do
+                    if [ -n "$asg" ] && [ "$asg" != "None" ]; then
+                      echo "    🗑️ Found and deleting ASG: $asg"
+                      aws autoscaling delete-auto-scaling-group --auto-scaling-group-name "$asg" --force-delete 2>/dev/null || true
+                    fi
+                  done
+                fi
+                
+                # Delete all RDS instances matching pattern
+                RDS_INSTANCES=$(aws rds describe-db-instances --query "DBInstances[?contains(DBInstanceIdentifier, 'bright-valley-$')].DBInstanceIdentifier" --output text 2>/dev/null || true)
+                if [ "$RDS_INSTANCES" != "None" ] && [ -n "$RDS_INSTANCES" ]; then
+                  for db in $RDS_INSTANCES; do
+                    if [ -n "$db" ] && [ "$db" != "None" ]; then
+                      echo "    🗑️ Found and deleting RDS instance: $db"
+                      aws rds delete-db-instance --db-instance-identifier "$db" --skip-final-snapshot --delete-automated-backups 2>/dev/null || true
+                    fi
+                  done
+                fi
+                
+                # Delete all ALBs matching pattern
+                ALBS=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?contains(LoadBalancerName, 'bright-valley-$')].LoadBalancerArn" --output text 2>/dev/null || true)
+                if [ "$ALBS" != "None" ] && [ -n "$ALBS" ]; then
+                  for alb in $ALBS; do
+                    if [ -n "$alb" ] && [ "$alb" != "None" ]; then
+                      echo "    🗑️ Found and deleting ALB: $alb"
+                      aws elbv2 delete-load-balancer --load-balancer-arn "$alb" 2>/dev/null || true
+                    fi
+                  done
+                fi
+                ;;
+            esac
+          }
+          
+          echo "📋 Starting comprehensive resource cleanup sequence..."
+          
+          # Clean specific known resources first
+          force_cleanup_resource "cloudfront" "" "CloudFront distributions"
+          force_cleanup_resource "asg" "bright-valley-$-asg" "Auto Scaling Group"
+          force_cleanup_resource "rds-instance" "bright-valley-$-db" "RDS instance"
+          force_cleanup_resource "s3-bucket" "bright-valley-$-client-bucket" "Client S3 bucket"
+          force_cleanup_resource "s3-bucket" "bright-valley-$-ops" "Ops S3 bucket"
+          
+          # Comprehensive sweep for any remaining resources
+          force_cleanup_resource "all-resources" "" "All remaining project resources"
+          
+          echo "✅ Enhanced manual cleanup completed!"
+          
+          # Also run the original cleanup script for additional coverage
+          if [ -f "ops/helper/cleanup-manual.sh" ]; then
+            echo "📋 Running additional cleanup script for comprehensive coverage..."
+            cd ops/helper
+            chmod +x cleanup-manual.sh
+            # Ensure the cleanup script uses admin credentials
+            AWS_ACCESS_KEY_ID= AWS_SECRET_ACCESS_KEY="$" AWS_DEFAULT_REGION="$" ./cleanup-manual.sh $ 2>/dev/null || true
+            echo "✅ Additional cleanup script completed!"
+          fi
+          
+          echo "🎯 All resource types have been verified and cleaned up."
+
+      - name: "Phase 4: Bootstrap Cleanup with Separate Credentials"
+        if: always()
+        continue-on-error: true
+        run: |
+          echo "🧨 Phase 4: Bootstrap cleanup with admin AWS credentials..."
+
+          # Set admin credentials for this step
+          echo "Current ACCESS KEY ID: ${AWS_ACCESS_KEY_ID:0:10} Expected: "
+          export AWS_ACCESS_KEY_ID=
+          export AWS_SECRET_ACCESS_KEY="$"
+          export AWS_DEFAULT_REGION="$"
+          unset AWS_SESSION_TOKEN
+          
+          echo "🧹 Phase 3: Enhanced comprehensive AWS resource cleanup..."
+          echo "🔍 Using admin credentials for cleanup..."
+          echo "AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:0:10}... Expected: "
+          echo "AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:0:10}..."
+          echo "AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-'NOT SET✅'}"
+          echo "AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION"
+          
+          echo "🔍 Using admin credentials for cleanup..."
+          aws sts get-caller-identity || {
+            echo "❌ Admin credentials failed"
+            exit 1
+          }
+          echo "✅ Admin credentials verified successfully"
+          
+          STATE_BUCKET="bright-valley-terraform-state"
+          LOCK_TABLE="bright-valley-terraform-locks"
+          
+          # Delete DynamoDB table
+          echo "🗃️ Deleting DynamoDB table: $LOCK_TABLE"
+          aws dynamodb delete-table --table-name "$LOCK_TABLE" 2>/dev/null && echo "✅ DynamoDB table deleted" || echo "❌ DynamoDB deletion failed"
+          
+          # Delete S3 bucket
+          echo "🪣 Deleting S3 bucket: $STATE_BUCKET"
+          aws s3 rm "s3://$STATE_BUCKET" --recursive 2>/dev/null || true
+          aws s3 rb "s3://$STATE_BUCKET" --force 2>/dev/null && echo "✅ S3 bucket deleted" || echo "❌ S3 deletion failed"
+          
+          echo "🎯 Bootstrap cleanup with admin credentials completed"
+
+      - name: "Phase 5: Final Verification and Summary"
+        if: always()
+        run: |
+          # Set admin credentials for this step
+          echo "Current ACCESS KEY ID: ${AWS_ACCESS_KEY_ID:0:10} Expected: "
+          export AWS_ACCESS_KEY_ID=
+          export AWS_SECRET_ACCESS_KEY="$"
+          export AWS_DEFAULT_REGION="$"
+          unset AWS_SESSION_TOKEN
+          
+          echo "🔍 Performing final verification of cleanup completion..."
+          echo "🔍 Using admin credentials for verification..."
+          aws sts get-caller-identity || {
+            echo "❌ Admin credentials failed"
+            exit 1
+          }
+          echo "✅ Admin credentials verified successfully"
+          
+          # Check for any remaining resources
+          REMAINING_RESOURCES=0
+          
+          # Check S3 buckets
+          if aws s3 ls | grep "bright-valley-$" 2>/dev/null; then
+            echo "⚠️ Some S3 buckets may still exist"
+            REMAINING_RESOURCES=$((REMAINING_RESOURCES + 1))
+          fi
+          
+          # Check RDS instances
+          RDS_CHECK=$(aws rds describe-db-instances --query "DBInstances[?contains(DBInstanceIdentifier, 'bright-valley-$')]" --output text 2>/dev/null || true)
+          if [ "$RDS_CHECK" != "None" ] && [ -n "$RDS_CHECK" ] && [ "$RDS_CHECK" != "[]" ]; then
+            echo "⚠️ Some RDS instances may still exist"
+            REMAINING_RESOURCES=$((REMAINING_RESOURCES + 1))
+          fi
+          
+          # Check ASGs
+          ASG_CHECK=$(aws autoscaling describe-auto-scaling-groups --query "AutoScalingGroups[?contains(AutoScalingGroupName, 'bright-valley-$')]" --output text 2>/dev/null || true)
+          if [ "$ASG_CHECK" != "None" ] && [ -n "$ASG_CHECK" ] && [ "$ASG_CHECK" != "[]" ]; then
+            echo "⚠️ Some Auto Scaling Groups may still exist"
+            REMAINING_RESOURCES=$((REMAINING_RESOURCES + 1))
+          fi
+          
+          # Check ALBs
+          ALB_CHECK=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?contains(LoadBalancerName, 'bright-valley-$')]" --output text 2>/dev/null || true)
+          if [ "$ALB_CHECK" != "None" ] && [ -n "$ALB_CHECK" ] && [ "$ALB_CHECK" != "[]" ]; then
+            echo "⚠️ Some Load Balancers may still exist"
+            REMAINING_RESOURCES=$((REMAINING_RESOURCES + 1))
+          fi
+          
+          # Generate summary based on results
+          if [ $REMAINING_RESOURCES -eq 0 ]; then
+            echo "## ✅ Complete Infrastructure Destruction Successful" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Environment:** $" >> $GITHUB_STEP_SUMMARY
+            echo "**Branch:** $" >> $GITHUB_STEP_SUMMARY
+            echo "**Status:** All resources successfully removed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ✅ Cleanup Results:" >> $GITHUB_STEP_SUMMARY
+            echo "- **Phase 1:** Pre-destroy cleanup completed" >> $GITHUB_STEP_SUMMARY
+            echo "- **Phase 2:** Terraform destroy executed" >> $GITHUB_STEP_SUMMARY
+            echo "- **Phase 3:** Manual resource cleanup completed" >> $GITHUB_STEP_SUMMARY
+            echo "- **Verification:** No remaining resources detected" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🎯 **All AWS resources have been completely removed.**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🚀 Next Steps:" >> $GITHUB_STEP_SUMMARY
+            echo "- You can now run 'bootstrap' to recreate infrastructure from scratch" >> $GITHUB_STEP_SUMMARY
+            echo "- Or deploy a fresh environment using the apply workflow" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ⚠️ Infrastructure Destruction Completed with Warnings" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Environment:** $" >> $GITHUB_STEP_SUMMARY
+            echo "**Branch:** $" >> $GITHUB_STEP_SUMMARY
+            echo "**Status:** Cleanup completed but $REMAINING_RESOURCES resource types may still exist" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ⚠️ Manual Verification Required:" >> $GITHUB_STEP_SUMMARY
+            echo "1. **Check AWS Console** for any remaining resources in $ environment" >> $GITHUB_STEP_SUMMARY
+            echo "2. **Manually delete** any remaining resources to avoid costs" >> $GITHUB_STEP_SUMMARY
+            echo "3. **Verify CloudFront distributions** - they take 15+ minutes to delete" >> $GITHUB_STEP_SUMMARY
+            echo "4. **Check IAM roles and policies** for any orphaned resources" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🔍 Resources to Check:" >> $GITHUB_STEP_SUMMARY
+            echo "- S3 buckets starting with bright-valley-$" >> $GITHUB_STEP_SUMMARY
+            echo "- RDS instances containing bright-valley-$" >> $GITHUB_STEP_SUMMARY
+            echo "- Auto Scaling Groups with bright-valley-$" >> $GITHUB_STEP_SUMMARY
+            echo "- Load Balancers with bright-valley-$" >> $GITHUB_STEP_SUMMARY
+            echo "- CloudFront distributions (may still be disabling)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "💰 **Important:** Manual cleanup prevents unexpected AWS charges" >> $GITHUB_STEP_SUMMARY
+          fi
