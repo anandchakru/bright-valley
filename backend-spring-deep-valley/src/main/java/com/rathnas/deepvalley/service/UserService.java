@@ -1,0 +1,113 @@
+package com.rathnas.deepvalley.service;
+
+import com.rathnas.deepvalley.jpa.entity.UserEntity;
+import com.rathnas.deepvalley.jpa.repository.UserRepository;
+import com.rathnas.deepvalley.jpa.enumtype.UserRole;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.beans.factory.annotation.Value;
+
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+@Transactional
+public class UserService {
+    
+    private final UserRepository userRepository;
+
+    @Value("${app.users.root}")
+    private String rootUser;
+
+    @Value("${app.users.admins}")
+    private Set<String> adminUsers;
+    
+    public Optional<UserEntity> findByEmail(String email) {
+        return userRepository.findByEmailAndDeletedFalse(email);
+    }
+    
+    public Optional<UserEntity> findByExternalAuth(String provider, String externalId) {
+        return userRepository.findByExternalAuthProviderAndExternalAuthIdAndDeletedFalse(provider, externalId);
+    }
+    
+    public Optional<UserEntity> findBySlug(String slug) {
+        return userRepository.findBySlugAndDeletedFalse(slug);
+    }
+    
+    public UserEntity createOrUpdateUser(String tenantId, String email, String externalProvider, String externalId, 
+                                        String firstName, String lastName, String picture) {
+        Optional<UserEntity> existingUser = findByExternalAuth(externalProvider, externalId);
+        
+        UserEntity user;
+        if (existingUser.isPresent()) {
+            user = existingUser.get();
+            log.debug("Updating existing user: {}", email);
+        } else {
+            List<UserRole> roles = List.of(UserRole.USER);
+            if (StringUtils.equalsIgnoreCase(rootUser, email)) {
+                log.warn("Creating root user: {}", email);
+                roles = List.of(UserRole.ROOT, UserRole.ADMIN, UserRole.USER);
+            } else if (adminUsers.stream().anyMatch(i -> StringUtils.equalsIgnoreCase(i, email))) {
+                log.warn("Creating admin user: {}", email);
+                roles = List.of(UserRole.ADMIN, UserRole.USER);
+            }
+            user = UserEntity.builder()
+                    .tenantId(tenantId)
+                    .email(email)
+                    .externalAuthProvider(externalProvider)
+                    .externalAuthId(externalId)
+                    .roles(roles)
+                    .build();
+            log.debug("Creating new user: {}", email);
+        }
+        
+        // Update user information
+        user.setFirstName(firstName);
+        user.setLastName(lastName);
+        user.setPicture(picture);
+        user.setEmail(email);
+        
+        return userRepository.save(user);
+    }
+    
+    public List<UserEntity> findByTenant(String tenantId) {
+        return userRepository.findByTenantIdAndDeletedFalse(tenantId);
+    }
+    
+    public List<UserEntity> findByRole(UserRole role) {
+        return userRepository.findByRoleAndDeletedFalse(role.getValue());
+    }
+    
+    public void softDeleteUser(Long userId, String reason) {
+        userRepository.findById(userId).ifPresent(user -> {
+            user.setDeleted(true);
+            user.setDeleteReason(reason);
+            userRepository.save(user);
+            log.info("Soft deleted user: {} with reason: {}", user.getEmail(), reason);
+        });
+    }
+    
+    public UserEntity addRole(Long userId, UserRole role) {
+        return userRepository.findById(userId).map(user -> {
+            if (!user.getRoles().contains(role)) {
+                user.getRoles().add(role);
+                return userRepository.save(user);
+            }
+            return user;
+        }).orElseThrow(() -> new RuntimeException("User not found: " + userId));
+    }
+    
+    public UserEntity removeRole(Long userId, UserRole role) {
+        return userRepository.findById(userId).map(user -> {
+            user.getRoles().remove(role);
+            return userRepository.save(user);
+        }).orElseThrow(() -> new RuntimeException("User not found: " + userId));
+    }
+}
