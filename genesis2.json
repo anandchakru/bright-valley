@@ -1,0 +1,71 @@
+{
+  "generator": "genesis2",
+  "version": "2.0.0",
+  "projectName": "bright-valley",
+  "projectId": 71,
+  "genId": 71,
+  "domain": "rathnas.com",
+  "sld": "rathnas",
+  "tld": "com",
+  "owner": "anandchakru",
+  "repo": "bright-valley",
+  "generatedAt": "2025-09-04T06:02:56.168Z",
+  "generatedBy": "genesis2-api",
+  "modules": [
+    {
+      "kind": "code",
+      "layer": "ops",
+      "type": "aws",
+      "name": "infrastructure",
+      "region": "us-west-1"
+    },
+    {
+      "kind": "code",
+      "layer": "backend",
+      "type": "spring",
+      "name": "deep-valley",
+      "region": "us-west-1"
+    },
+    {
+      "kind": "extension",
+      "layer": "common-config",
+      "type": "spring",
+      "name": "deep-valley",
+      "region": "us-west-1"
+    },
+    {
+      "kind": "extension",
+      "layer": "third-party",
+      "type": "env",
+      "name": "auth0",
+      "region": "us-west-1"
+    },
+    {
+      "kind": "code",
+      "layer": "frontend",
+      "type": "react",
+      "name": "bright-ocean",
+      "region": "us-west-1"
+    },
+    {
+      "kind": "extension",
+      "layer": "common-config",
+      "type": "react",
+      "name": "bright-ocean",
+      "region": "us-west-1"
+    },
+    {
+      "kind": "code",
+      "layer": "docs",
+      "type": "md",
+      "name": "readme",
+      "region": "us-west-1"
+    }
+  ],
+  "metadata": {
+    "version": "1.0.0",
+    "license": "MIT",
+    "tags": [
+    ]
+  }
+}
