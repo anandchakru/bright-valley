@@ -1,0 +1,111 @@
+#!/bin/bash
+set -e
+
+# Variables passed from Terraform
+OPS_BUCKET="${ops_bucket}"
+SECRET_ARN="${secret_arn}"
+ENVIRONMENT="${environment}"
+AWS_REGION="${aws_region}"
+PROJECT_NAME="${project_name}"
+
+# Log everything
+exec > >(tee /var/log/user-data.log)
+exec 2>&1
+
+echo "=== Starting Minimal EC2 Instance Setup ==="
+echo "OPS_BUCKET: $OPS_BUCKET"
+echo "ENVIRONMENT: $ENVIRONMENT"
+echo "AWS_REGION: $AWS_REGION"
+echo "PROJECT: $PROJECT_NAME"
+
+# Basic system setup
+echo "=== Installing basic system packages ==="
+yum update -y
+yum install -y awscli jq wget curl unzip
+
+
+
+# Install SSM Agent (for GitHub Actions communication)
+echo "=== Installing SSM Agent ==="
+yum install -y amazon-ssm-agent
+systemctl enable amazon-ssm-agent
+systemctl start amazon-ssm-agent
+
+# Install CloudWatch agent for monitoring
+echo "=== Installing CloudWatch Agent ==="
+yum install -y amazon-cloudwatch-agent
+
+# Configure basic CloudWatch agent for system monitoring
+echo "=== Configuring CloudWatch Agent ==="
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << EOF
+{
+    "agent": {
+        "metrics_collection_interval": 60,
+        "run_as_user": "cwagent"
+    },
+    "logs": {
+        "logs_collected": {
+            "files": {
+                "collect_list": [
+                    {
+                        "file_path": "/var/log/user-data.log",
+                        "log_group_name": "/$PROJECT_NAME/$ENVIRONMENT/user-data",
+                        "log_stream_name": "{instance_id}",
+                        "retention_in_days": 7
+                    }
+                ]
+            }
+        }
+    },
+    "metrics": {
+        "namespace": "$PROJECT_NAME/$ENVIRONMENT",
+        "metrics_collected": {
+            "cpu": {
+                "measurement": ["cpu_usage_idle", "cpu_usage_user", "cpu_usage_system"],
+                "metrics_collection_interval": 60
+            },
+            "disk": {
+                "measurement": ["used_percent"],
+                "metrics_collection_interval": 60,
+                "resources": ["*"]
+            },
+            "mem": {
+                "measurement": ["mem_used_percent"],
+                "metrics_collection_interval": 60
+            }
+        }
+    }
+}
+EOF
+
+# Start CloudWatch agent
+echo "=== Starting CloudWatch Agent ==="
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+    -a fetch-config \
+    -m ec2 \
+    -s \
+    -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+systemctl enable amazon-cloudwatch-agent
+systemctl start amazon-cloudwatch-agent
+
+# Create environment info for ec2-setup scripts
+echo "=== Creating environment info for application setup ==="
+mkdir -p /opt/bootstrap
+cat > /opt/bootstrap/env.sh << EOF
+#!/bin/bash
+# Environment info for ec2-setup scripts
+export OPS_BUCKET="$OPS_BUCKET"
+export SECRET_ARN="$SECRET_ARN"
+export ENVIRONMENT="$ENVIRONMENT"
+export AWS_REGION="$AWS_REGION"
+export PROJECT_NAME="$PROJECT_NAME"
+EOF
+
+chmod +x /opt/bootstrap/env.sh
+
+echo "✅ Minimal EC2 setup completed!"
+echo "ℹ️  Application setup will be handled by ec2-setup scripts during deployment"
+echo "📋 Environment: $ENVIRONMENT"
+echo "📋 OPS Bucket: $OPS_BUCKET"
+echo "📋 AWS Region: $AWS_REGION"
