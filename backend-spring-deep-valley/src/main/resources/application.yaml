@@ -1,0 +1,82 @@
+app:
+  users: 
+    root: 
+    admins: 
+  datasource:
+    schema: deep-valley
+  cors:
+    origins: "http://localhost:*,https://*.rathnas.com,https://rathnas.com"
+  env:
+    host: deep-valley-api.rathnas.com
+  uris:
+    public: "/,/app/**,/public/**,/pub/**,/v3/api-docs/**,/swagger-ui/**,/index.html,/error,/favicon.ico"
+  security:
+    jwt-secret-key: ${SPRING_ENV_JWT_SECRET_KEY:default-jwt-secret}
+    api-key: ${SPRING_ENV_API_KEY:default-api-key}
+    encryption-key: ${SPRING_ENV_ENCRYPTION_KEY:default-encryption-key}
+    stripe:
+      standard: ${SPRING_ENV_STRIPE_STANDARD:default-stripe-standard-key}
+      restricted: ${SPRING_ENV_STRIPE_RESTRICTED:default-stripe-restricted-key}
+  auth0:
+    domain: dev.auth0.rathnas.com
+    audience: 
+    client-id: 
+    client-secret: ${ENV_deep_valley_AUTH0_SECRET}
+    jwt:
+      issuer-uri: https://dev.auth0.rathnas.com
+      audiences:
+        - 
+      role:
+        claim:
+          key: https://deep-valley-api.rathnas.com/roles
+
+spring:
+  application:
+    name: deep-valley-api
+
+  datasource:
+    name: ${SPRING_ENV_DB_NAME:deep-valley-db}
+    driver-class-name: org.postgresql.Driver
+    username: ${SPRING_ENV_DB_USERNAME:deep-valley-user}
+    password: ${SPRING_ENV_DB_PASSWORD:deep-valley-pwd}
+    host: ${SPRING_ENV_DB_HOST:localhost}
+    port: ${SPRING_ENV_DB_PORT:5432}
+    url: jdbc:postgresql://${spring.datasource.host}:${spring.datasource.port}/${spring.datasource.name}?currentSchema=${app.datasource.schema}
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+
+  liquibase:
+    change-log: classpath:db/changelog/db.changelog-master.yaml
+    default-schema: ${app.datasource.schema}
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://dev.auth0.rathnas.com
+          audiences:
+            - 
+
+springdoc:
+  swagger-ui:
+    defaultModelsExpandDepth: 0
+    tagsSorter: alpha
+    operationsSorter: method
+    tryItOutEnabled: true
+    filter: true
+    doc-expansion: none
+
+server:
+  port: 8080
+
+logging:
+  level:
+    rathnas.com.deep-valley: DEBUG
+    org.springframework.security: DEBUG
