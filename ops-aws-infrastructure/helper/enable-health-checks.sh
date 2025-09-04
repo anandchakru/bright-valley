@@ -1,0 +1,71 @@
+#!/bin/bash
+set -e
+
+PROJECT_NAME="bright-valley"
+ENVIRONMENT="${1:-prod}"  # Default to prod if not specified
+
+echo "🔍 Enabling ELB health checks for Auto Scaling Group..."
+
+# Wait for all instances to be healthy first
+echo "⏳ Waiting for all instances to be ready..."
+aws autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$PROJECT_NAME-$ENVIRONMENT-asg" \
+    --region "" \
+    --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].[InstanceId,HealthStatus]' \
+    --output table
+
+# Check if application is responding on all instances
+echo "🔍 Checking application health on all instances..."
+INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$PROJECT_NAME-$ENVIRONMENT-asg" \
+    --region "" \
+    --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
+    --output text)
+
+for instance_id in $INSTANCE_IDS; do
+    echo "Checking instance $instance_id..."
+    
+    # Use SSM to check if the application is responding
+    command_id=$(aws ssm send-command \
+        --instance-ids "$instance_id" \
+        --document-name "AWS-RunShellScript" \
+        --parameters 'commands=["curl -f http://localhost:8080/app/v1/health && echo SUCCESS || echo FAILED"]' \
+        --region "" \
+        --query 'Command.CommandId' \
+        --output text)
+    
+    # Wait for command to complete
+    sleep 5
+    
+    # Get result
+    result=$(aws ssm get-command-invocation \
+        --command-id "$command_id" \
+        --instance-id "$instance_id" \
+        --region "" \
+        --query 'StandardOutputContent' \
+        --output text)
+    
+    if [[ "$result" == *"SUCCESS"* ]]; then
+        echo "✅ Instance $instance_id is healthy"
+    else
+        echo "❌ Instance $instance_id is not responding to health checks"
+        echo "Output: $result"
+        exit 1
+    fi
+done
+
+# All instances are healthy, now enable ELB health checks
+echo "🔄 Switching Auto Scaling Group to ELB health checks..."
+aws autoscaling update-auto-scaling-group \
+    --auto-scaling-group-name "$PROJECT_NAME-$ENVIRONMENT-asg" \
+    --health-check-type "ELB" \
+    --health-check-grace-period 300 \
+    --region ""
+
+echo "✅ ELB health checks enabled successfully!"
+echo "🔍 Current ASG status:"
+aws autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$PROJECT_NAME-$ENVIRONMENT-asg" \
+    --region "" \
+    --query 'AutoScalingGroups[0].{HealthCheckType:HealthCheckType,HealthCheckGracePeriod:HealthCheckGracePeriod,MinSize:MinSize,MaxSize:MaxSize,DesiredCapacity:DesiredCapacity}' \
+    --output table
