@@ -1,0 +1,366 @@
+name: Appinfra-010-Init
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: 
+  AWS_ACCESS_KEY_ID: 
+
+jobs:
+  init:
+    name: Init
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Env setup
+        run: |
+          if [[ "$" != "main" && "$" != "dev" ]]; then
+            echo "⚠️ Workflow only supports 'main' or 'dev' branches"
+            echo "Current branch: $"
+            echo "Exiting with no-op"
+            exit 0
+          fi
+          
+          # Set environment variables
+          echo "BRANCH=$" >> $GITHUB_ENV
+          if [ "$" = "main" ]; then
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=test" >> $GITHUB_ENV
+          fi
+          
+          echo "✅ Environment setup completed: $"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: $
+          aws-secret-access-key: $
+          aws-region: $
+
+      - name: Create Trust Policy and Roles needed for All other github actions
+        run: |
+          echo "🔐 Setting up GitHub OIDC Identity Provider and IAM roles..."
+          
+          # Create GitHub OIDC Identity Provider (if it doesn't exist)
+          if ! aws iam get-open-id-connect-provider --open-id-connect-provider-arn "arn:aws:iam:::oidc-provider/token.actions.githubusercontent.com" 2>/dev/null; then
+            echo "Creating GitHub OIDC Identity Provider..."
+            aws iam create-open-id-connect-provider \
+              --url https://token.actions.githubusercontent.com \
+              --client-id-list sts.amazonaws.com \
+              --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1 \
+              --thumbprint-list 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+          else
+            echo "GitHub OIDC Identity Provider already exists"
+          fi
+          
+          # Get repository information from GitHub context
+          REPO_OWNER="$"
+          REPO_NAME="$"
+          
+          echo "Repository: ${REPO_OWNER}/${REPO_NAME}"
+          
+          # Create trust policy for GitHub Actions
+          cat > /tmp/github-trust-policy.json <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Federated": "arn:aws:iam:::oidc-provider/token.actions.githubusercontent.com"
+                },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+                  },
+                  "StringLike": {
+                    "token.actions.githubusercontent.com:sub": "repo:${REPO_OWNER}/${REPO_NAME}:*"
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+          
+          # 1. Create Terraform Role for Infrastructure Operations
+          echo "🏗️ Creating Terraform role..."
+          cat > /tmp/terraform-policy.json <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "ec2:*",
+                  "rds:*",
+                  "s3:*",
+                  "cloudfront:*",
+                  "elasticloadbalancing:*",
+                  "autoscaling:*",
+                  "iam:*",
+                  "secretsmanager:*",
+                  "ssm:*",
+                  "logs:*",
+                  "route53:*",
+                  "acm:*",
+                  "dynamodb:*",
+                  "cloudwatch:*"
+                ],
+                "Resource": "*"
+              }
+            ]
+          }
+          EOF
+          
+          # Create or update terraform role
+          aws iam create-role \
+            --role-name "bright-valley-terraform-role" \
+            --assume-role-policy-document file:///tmp/github-trust-policy.json \
+            --description "Role for Terraform infrastructure operations via GitHub Actions" || \
+          aws iam update-assume-role-policy \
+            --role-name "bright-valley-terraform-role" \
+            --policy-document file:///tmp/github-trust-policy.json
+          
+          aws iam put-role-policy \
+            --role-name "bright-valley-terraform-role" \
+            --policy-name "TerraformFullAccess" \
+            --policy-document file:///tmp/terraform-policy.json
+          
+          # 2. Create S3 Deployment Role for Client Operations
+          echo "🌐 Creating S3 deployment role..."
+          cat > /tmp/s3-deploy-policy.json <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "s3:ListAllMyBuckets"
+                ],
+                "Resource": "*"
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "s3:GetObject",
+                  "s3:PutObject",
+                  "s3:DeleteObject",
+                  "s3:ListBucket",
+                  "s3:GetBucketLocation",
+                  "s3:GetBucketVersioning",
+                  "s3:PutBucketVersioning",
+                  "s3:GetBucketAcl",
+                  "s3:PutBucketAcl",
+                  "s3:GetBucketPolicy",
+                  "s3:PutBucketPolicy",
+                  "s3:DeleteBucketPolicy"
+                ],
+                "Resource": [
+                  "arn:aws:s3:::*bright-valley*",
+                  "arn:aws:s3:::*bright-valley*/*"
+                ]
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "cloudfront:CreateInvalidation",
+                  "cloudfront:GetInvalidation",
+                  "cloudfront:ListInvalidations",
+                  "cloudfront:GetDistribution",
+                  "cloudfront:GetDistributionConfig",
+                  "cloudfront:ListDistributions"
+                ],
+                "Resource": "*"
+              }
+            ]
+          }
+          EOF
+          
+          aws iam create-role \
+            --role-name "bright-valley-$-ops-deploy-s3-role" \
+            --assume-role-policy-document file:///tmp/github-trust-policy.json \
+            --description "Role for S3 and CloudFront operations via GitHub Actions ($)" || \
+          aws iam update-assume-role-policy \
+            --role-name "bright-valley-$-ops-deploy-s3-role" \
+            --policy-document file:///tmp/github-trust-policy.json
+          
+          aws iam put-role-policy \
+            --role-name "bright-valley-$-ops-deploy-s3-role" \
+            --policy-name "S3CloudFrontAccess" \
+            --policy-document file:///tmp/s3-deploy-policy.json
+          
+          # 3. Create EC2 Deployment Role for Server Operations
+          echo "🖥️ Creating EC2 deployment role..."
+          cat > /tmp/ec2-deploy-policy.json <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "s3:ListAllMyBuckets"
+                ],
+                "Resource": "*"
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "s3:GetObject",
+                  "s3:PutObject",
+                  "s3:ListBucket"
+                ],
+                "Resource": [
+                  "arn:aws:s3:::*bright-valley*",
+                  "arn:aws:s3:::*bright-valley*/*",
+                  "arn:aws:s3:::bright-valley-*-api",
+                  "arn:aws:s3:::bright-valley-*-api/*",
+                  "arn:aws:s3:::bright-valley-*-ops", 
+                  "arn:aws:s3:::bright-valley-*-ops/*"
+                ]
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "ssm:SendCommand",
+                  "ssm:GetCommandInvocation",
+                  "ssm:DescribeInstanceInformation",
+                  "ssm:DescribeInstances",
+                  "ssm:ListCommands",
+                  "ssm:ListCommandInvocations",
+                  "ssm:GetParameter",
+                  "ssm:GetParameters",
+                  "ssm:GetParameterHistory"
+                ],
+                "Resource": "*"
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "ec2:DescribeInstances",
+                  "ec2:DescribeInstanceStatus",
+                  "ec2:DescribeInstanceAttribute",
+                  "ec2:DescribeTags"
+                ],
+                "Resource": "*"
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "autoscaling:DescribeAutoScalingGroups",
+                  "autoscaling:DescribeAutoScalingInstances",
+                  "autoscaling:DescribeLaunchConfigurations",
+                  "autoscaling:UpdateAutoScalingGroup"
+                ],
+                "Resource": "*"
+              }
+            ]
+          }
+          EOF
+          
+          aws iam create-role \
+            --role-name "bright-valley-$-ops-deploy-ec2-role" \
+            --assume-role-policy-document file:///tmp/github-trust-policy.json \
+            --description "Role for EC2 and SSM operations via GitHub Actions ($)" || \
+          aws iam update-assume-role-policy \
+            --role-name "bright-valley-$-ops-deploy-ec2-role" \
+            --policy-document file:///tmp/github-trust-policy.json
+          
+          aws iam put-role-policy \
+            --role-name "bright-valley-$-ops-deploy-ec2-role" \
+            --policy-name "EC2SSMAccess" \
+            --policy-document file:///tmp/ec2-deploy-policy.json
+          
+          echo "✅ Successfully created all IAM roles and policies:"
+          echo "   - bright-valley-terraform-role (Infrastructure operations)"
+          echo "   - bright-valley-$-ops-deploy-s3-role (Client deployments)"
+          echo "   - bright-valley-$-ops-deploy-ec2-role (Server deployments)"
+          
+          echo "🔍 Listing created roles:"
+          aws iam list-roles --query 'Roles[?contains(RoleName, `bright-valley`)].{RoleName:RoleName,Arn:Arn}' --output table
+
+      - name: Check and Generate SSH Keys
+        run: |
+          echo "🔑 Checking SSH keys in S3 terraform-state bucket..."
+          
+          # Determine the terraform state bucket name
+          STATE_BUCKET="bright-valley-terraform-state"
+          
+          echo "Checking for SSH keys in bucket: $STATE_BUCKET"
+          
+          # Check if the bucket exists
+          if ! aws s3api head-bucket --bucket "$STATE_BUCKET" 2>/dev/null; then
+            echo "⚠️ Terraform state bucket $STATE_BUCKET doesn't exist yet"
+            echo "SSH keys will be generated during bootstrap phase"
+            exit 0
+          fi
+          
+          # Check if ssh directory and keys exist for current environment
+          CURRENT_ENV="$"
+          echo "🔍 Checking for existing SSH keys for environment: $CURRENT_ENV"
+          
+          MISSING_KEYS=()
+          
+          # Check for environment-specific keys
+          if ! aws s3 ls "s3://$STATE_BUCKET/ssh/${CURRENT_ENV}_key" >/dev/null 2>&1; then
+            echo "❌ ${CURRENT_ENV} SSH key not found"
+            MISSING_KEYS+=("$CURRENT_ENV")
+          else
+            echo "✅ ${CURRENT_ENV} SSH key found"
+          fi
+          
+          if ! aws s3 ls "s3://$STATE_BUCKET/ssh/${CURRENT_ENV}_key.pub" >/dev/null 2>&1; then
+            echo "❌ ${CURRENT_ENV} SSH public key not found"
+            MISSING_KEYS+=("$CURRENT_ENV")
+          else
+            echo "✅ ${CURRENT_ENV} SSH public key found"
+          fi
+          
+          # Generate missing keys
+          if [ ${#MISSING_KEYS[@]} -eq 0 ]; then
+            echo "✅ All SSH keys are present in S3"
+          else
+            echo "🔑 Generating missing SSH keys..."
+            
+            # Create temporary directory for key generation
+            TEMP_DIR=$(mktemp -d)
+            cd "$TEMP_DIR"
+            
+            # Remove duplicates from MISSING_KEYS array
+            UNIQUE_MISSING=($(printf "%s\n" "${MISSING_KEYS[@]}" | sort -u))
+            
+            for ENV in "${UNIQUE_MISSING[@]}"; do
+              echo "Generating SSH key pair for ${ENV} environment..."
+              
+              # Generate SSH key pair
+              ssh-keygen -t rsa -b 4096 -f "${ENV}_key" -N "" -C "bright-valley-${ENV}"
+              
+              echo "✅ Generated ${ENV}_key and ${ENV}_key.pub"
+              
+              # Upload to S3
+              echo "📤 Uploading ${ENV} SSH keys to S3..."
+              aws s3 cp "${ENV}_key" "s3://$STATE_BUCKET/ssh/${ENV}_key"
+              aws s3 cp "${ENV}_key.pub" "s3://$STATE_BUCKET/ssh/${ENV}_key.pub"
+              
+              echo "✅ Uploaded ${ENV} SSH keys to s3://$STATE_BUCKET/ssh/"
+            done
+            
+            # Cleanup temporary directory
+            cd /
+            rm -rf "$TEMP_DIR"
+            echo "🧹 Cleaned up temporary files"
+          fi
+          
+          echo "🔍 Final SSH key inventory in S3:"
+          aws s3 ls "s3://$STATE_BUCKET/ssh/" || echo "No ssh directory found in S3"
+          
+          echo "📝 Note: S3 ops buckets will be created by Terraform during deploy_apply operation"
