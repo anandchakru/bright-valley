@@ -1,0 +1,107 @@
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# Production builds
+build/
+dist/
+out/
+target/
+*.jar
+*.war
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.env
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+*.lcov
+
+# Temporary folders
+tmp/
+temp/
+
+# Generated files
+ops-aws-infrastructure/build/
+ops-aws-infrastructure/dist/
+ops-aws-infrastructure/target/
+ops-aws-infrastructure/.env*
+ops-aws-infrastructure/node_modules/
+backend-spring-deep-valley/build/
+backend-spring-deep-valley/dist/
+backend-spring-deep-valley/target/
+backend-spring-deep-valley/.env*
+backend-spring-deep-valley/node_modules/
+common-config-spring-deep-valley/build/
+common-config-spring-deep-valley/dist/
+common-config-spring-deep-valley/target/
+common-config-spring-deep-valley/.env*
+common-config-spring-deep-valley/node_modules/
+third-party-env-auth0/build/
+third-party-env-auth0/dist/
+third-party-env-auth0/target/
+third-party-env-auth0/.env*
+third-party-env-auth0/node_modules/
+frontend-react-bright-ocean/build/
+frontend-react-bright-ocean/dist/
+frontend-react-bright-ocean/target/
+frontend-react-bright-ocean/.env*
+frontend-react-bright-ocean/node_modules/
+common-config-react-bright-ocean/build/
+common-config-react-bright-ocean/dist/
+common-config-react-bright-ocean/target/
+common-config-react-bright-ocean/.env*
+common-config-react-bright-ocean/node_modules/
+docs-md-readme/build/
+docs-md-readme/dist/
+docs-md-readme/target/
+docs-md-readme/.env*
+docs-md-readme/node_modules/
+
+# Cloud and deployment
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
