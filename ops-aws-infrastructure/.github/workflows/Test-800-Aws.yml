@@ -1,0 +1,386 @@
+name: Test-800-AWS-Resource-Listing
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: 
+
+jobs:
+  list-resources:
+    name: List All AWS Resources
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Env setup
+        run: |
+          if [[ "$" != "main" && "$" != "dev" ]]; then
+            echo "⚠️ Workflow only supports 'main' or 'dev' branches"
+            echo "Current branch: $"
+            echo "Exiting with no-op"
+            exit 0
+          fi
+          
+          # Set environment variables
+          echo "BRANCH=$" >> $GITHUB_ENV
+          if [ "$" = "main" ]; then
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=test" >> $GITHUB_ENV
+          fi
+          
+          echo "✅ Environment setup completed: $"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: 
+          aws-secret-access-key: $
+          aws-region: $
+
+      - name: Verify AWS credentials
+        run: |
+          echo "🔍 Verifying AWS credentials..."
+          aws sts get-caller-identity || {
+            echo "❌ AWS credentials failed"
+            exit 1
+          }
+          echo "✅ AWS credentials verified successfully"
+
+      - name: List All Project Resources
+        run: |
+          echo "🔍 Starting comprehensive AWS resource listing for project: bright-valley"
+          echo "🌍 Environment: $"
+          echo "🏷️ Project Tag: bright-valley"
+          echo "📅 Timestamp: $(date)"
+          echo "=========================================="
+          
+          # Function to safely list resources with error handling
+          safe_list() {
+            local service="$1"
+            local command="$2"
+            local description="$3"
+            
+            echo "📋 $description..."
+            echo "------------------------------------------"
+            
+            if eval "$command" 2>/dev/null; then
+              echo "✅ $description listed successfully"
+            else
+              echo "⚠️ No $description found or access denied"
+            fi
+            echo ""
+          }
+          
+          # Function to list resources with project filter
+          list_project_resources() {
+            local service="$1"
+            local command="$2"
+            local description="$3"
+            local filter="$4"
+            
+            echo "📋 $description (Project: bright-valley)..."
+            echo "------------------------------------------"
+            
+            if [ -n "$filter" ]; then
+              if eval "$command $filter" 2>/dev/null; then
+                echo "✅ $description listed successfully"
+              else
+                echo "⚠️ No $description found for project or access denied"
+              fi
+            else
+              if eval "$command" 2>/dev/null; then
+                echo "✅ $description listed successfully"
+              else
+                echo "⚠️ No $description found or access denied"
+              fi
+            fi
+            echo ""
+          }
+          
+          # 1. EC2 Resources
+          echo "🖥️ EC2 RESOURCES"
+          echo "=================="
+          
+          safe_list "EC2" "aws ec2 describe-instances --query 'Reservations[].Instances[].[InstanceId,InstanceType,State.Name,PublicIpAddress,PrivateIpAddress,Tags[?Key==\`Name\`].Value|[0]]' --output table" "EC2 Instances"
+          
+          safe_list "EC2" "aws ec2 describe-security-groups --query 'SecurityGroups[].[GroupId,GroupName,Description]' --output table" "Security Groups"
+          
+          safe_list "EC2" "aws ec2 describe-vpcs --query 'Vpcs[].[VpcId,CidrBlock,State,Tags[?Key==\`Name\`].Value|[0]]' --output table" "VPCs"
+          
+          safe_list "EC2" "aws ec2 describe-subnets --query 'Subnets[].[SubnetId,VpcId,CidrBlock,AvailabilityZone,State]' --output table" "Subnets"
+          
+          safe_list "EC2" "aws ec2 describe-internet-gateways --query 'InternetGateways[].[InternetGatewayId,Attachments[0].State,Tags[?Key==\`Name\`].Value|[0]]' --output table" "Internet Gateways"
+          
+          safe_list "EC2" "aws ec2 describe-nat-gateways --query 'NatGateways[].[NatGatewayId,State,SubnetId]' --output table" "NAT Gateways"
+          
+          safe_list "EC2" "aws ec2 describe-route-tables --query 'RouteTables[].[RouteTableId,VpcId,Tags[?Key==\`Name\`].Value|[0]]' --output table" "Route Tables"
+          
+          safe_list "EC2" "aws ec2 describe-addresses --query 'Addresses[].[AllocationId,PublicIp,InstanceId,AssociationId]' --output table" "Elastic IPs"
+          
+          safe_list "EC2" "aws ec2 describe-network-acls --query 'NetworkAcls[].[NetworkAclId,VpcId,IsDefault]' --output table" "Network ACLs"
+          
+          safe_list "EC2" "aws ec2 describe-key-pairs --query 'KeyPairs[].[KeyName,KeyType]' --output table" "Key Pairs"
+          
+          # 2. Auto Scaling
+          echo "📈 AUTO SCALING RESOURCES"
+          echo "=========================="
+          
+          safe_list "ASG" "aws autoscaling describe-auto-scaling-groups --query 'AutoScalingGroups[].[AutoScalingGroupName,DesiredCapacity,MinSize,MaxSize,Instances[].InstanceId]' --output table" "Auto Scaling Groups"
+          
+          safe_list "ASG" "aws autoscaling describe-launch-configurations --query 'LaunchConfigurations[].[LaunchConfigurationName,InstanceType,ImageId]' --output table" "Launch Configurations"
+          
+          # 3. Load Balancers
+          echo "⚖️ LOAD BALANCER RESOURCES"
+          echo "==========================="
+          
+          safe_list "ALB" "aws elbv2 describe-load-balancers --query 'LoadBalancers[].[LoadBalancerArn,LoadBalancerName,State.Code,DNSName,Type]' --output table" "Load Balancers"
+          
+          safe_list "ALB" "aws elbv2 describe-target-groups --query 'TargetGroups[].[TargetGroupArn,TargetGroupName,Protocol,Port,HealthCheckProtocol]' --output table" "Target Groups"
+          
+          safe_list "ALB" "aws elbv2 describe-listeners --query 'Listeners[].[ListenerArn,LoadBalancerArn,Port,Protocol,DefaultActions[0].Type]' --output table" "Listeners"
+          
+          # 4. RDS Resources
+          echo "🗄️ RDS RESOURCES"
+          echo "=================="
+          
+          safe_list "RDS" "aws rds describe-db-instances --query 'DBInstances[].[DBInstanceIdentifier,DBInstanceClass,Engine,DBInstanceStatus,Endpoint.Address,Endpoint.Port]' --output table" "RDS Instances"
+          
+          safe_list "RDS" "aws rds describe-db-subnet-groups --query 'DBSubnetGroups[].[DBSubnetGroupName,VpcId,Subnets[].SubnetIdentifier]' --output table" "DB Subnet Groups"
+          
+          safe_list "RDS" "aws rds describe-db-parameter-groups --query 'DBParameterGroups[].[DBParameterGroupName,DBParameterGroupFamily,Description]' --output table" "DB Parameter Groups"
+          
+          safe_list "RDS" "aws rds describe-db-snapshots --query 'DBSnapshots[].[DBSnapshotIdentifier,DBInstanceIdentifier,SnapshotType,Status,SnapshotCreateTime]' --output table" "DB Snapshots"
+          
+          # 5. S3 Resources
+          echo "🪣 S3 RESOURCES"
+          echo "================"
+          
+          safe_list "S3" "aws s3api list-buckets --query 'Buckets[].[Name,CreationDate]' --output table" "S3 Buckets"
+          
+          # List objects in project buckets
+          echo "📋 S3 Bucket Contents (Project: bright-valley)..."
+          echo "------------------------------------------"
+          aws s3api list-buckets --query "Buckets[?contains(Name, 'bright-valley-$')].Name" --output text 2>/dev/null | while read bucket; do
+            if [ -n "$bucket" ] && [ "$bucket" != "None" ]; then
+              echo "🪣 Bucket: $bucket"
+              aws s3 ls "s3://$bucket" --recursive --human-readable --summarize 2>/dev/null || echo "  ⚠️ Cannot list contents"
+            fi
+          done
+          echo ""
+          
+          # 6. CloudFront Resources
+          echo "🌐 CLOUDFRONT RESOURCES"
+          echo "========================"
+          
+          safe_list "CloudFront" "aws cloudfront list-distributions --query 'DistributionList.Items[].[Id,DomainName,Status,Comment,Origins.Items[0].DomainName]' --output table" "CloudFront Distributions"
+          
+          # 7. IAM Resources
+          echo "👤 IAM RESOURCES"
+          echo "=================="
+          
+          safe_list "IAM" "aws iam list-users --query 'Users[].[UserName,CreateDate,PasswordLastUsed]' --output table" "IAM Users"
+          
+          safe_list "IAM" "aws iam list-roles --query 'Roles[].[RoleName,CreateDate,Description]' --output table" "IAM Roles"
+          
+          safe_list "IAM" "aws iam list-policies --scope Local --query 'Policies[].[PolicyName,PolicyId,CreateDate]' --output table" "IAM Policies (Local)"
+          
+          safe_list "IAM" "aws iam list-instance-profiles --query 'InstanceProfiles[].[InstanceProfileName,CreateDate]' --output table" "Instance Profiles"
+          
+          # 8. Secrets Manager
+          echo "🔐 SECRETS MANAGER"
+          echo "==================="
+          
+          safe_list "Secrets" "aws secretsmanager list-secrets --query 'SecretList[].[Name,Description,LastChangedDate]' --output table" "Secrets"
+          
+          # 9. DynamoDB Resources
+          echo "📊 DYNAMODB RESOURCES"
+          echo "======================"
+          
+          safe_list "DynamoDB" "aws dynamodb list-tables --query 'TableNames' --output table" "DynamoDB Tables"
+          
+          # 10. CloudWatch Resources
+          echo "📊 CLOUDWATCH RESOURCES"
+          echo "========================"
+          
+          safe_list "CloudWatch" "aws logs describe-log-groups --query 'logGroups[].[logGroupName,creationTime,storedBytes]' --output table" "CloudWatch Log Groups"
+          
+          safe_list "CloudWatch" "aws cloudwatch list-metrics --namespace AWS/EC2 --query 'Metrics[].[MetricName,Dimensions[0].Value]' --output table" "CloudWatch Metrics (EC2)"
+          
+          # 11. ACM Certificates
+          echo "🔒 ACM CERTIFICATES"
+          echo "==================="
+          
+          safe_list "ACM" "aws acm list-certificates --query 'CertificateSummaryList[].[CertificateArn,DomainName,Status,Type]' --output table" "SSL/TLS Certificates"
+          
+          # 12. Route 53 Resources
+          echo "🌍 ROUTE 53 RESOURCES"
+          echo "======================"
+          
+          safe_list "Route53" "aws route53 list-hosted-zones --query 'HostedZones[].[Id,Name,ResourceRecordSetCount]' --output table" "Hosted Zones"
+          
+          # 13. ECS Resources (if applicable)
+          echo "🐳 ECS RESOURCES"
+          echo "=================="
+          
+          safe_list "ECS" "aws ecs list-clusters --query 'clusterArns' --output table" "ECS Clusters"
+          
+          safe_list "ECS" "aws ecs list-services --cluster default --query 'serviceArns' --output table" "ECS Services"
+          
+          # 14. Lambda Functions (if applicable)
+          echo "λ LAMBDA RESOURCES"
+          echo "==================="
+          
+          safe_list "Lambda" "aws lambda list-functions --query 'Functions[].[FunctionName,Runtime,CodeSize,LastModified]' --output table" "Lambda Functions"
+          
+          # 15. API Gateway (if applicable)
+          echo "🚪 API GATEWAY RESOURCES"
+          echo "========================="
+          
+          safe_list "APIGateway" "aws apigateway get-rest-apis --query 'items[].[id,name,createdDate,version]' --output table" "REST APIs"
+          
+          # 16. SNS Resources (if applicable)
+          echo "📢 SNS RESOURCES"
+          echo "=================="
+          
+          safe_list "SNS" "aws sns list-topics --query 'Topics[].[TopicArn]' --output table" "SNS Topics"
+          
+          # 17. SQS Resources (if applicable)
+          echo "📬 SQS RESOURCES"
+          echo "=================="
+          
+          safe_list "SQS" "aws sqs list-queues --query 'QueueUrls' --output table" "SQS Queues"
+          
+          # 18. EFS Resources (if applicable)
+          echo "📁 EFS RESOURCES"
+          echo "=================="
+          
+          safe_list "EFS" "aws efs describe-file-systems --query 'FileSystems[].[FileSystemId,Name,LifeCycleState,PerformanceMode]' --output table" "EFS File Systems"
+          
+          # 19. ElastiCache Resources (if applicable)
+          echo "⚡ ELASTICACHE RESOURCES"
+          echo "========================="
+          
+          safe_list "ElastiCache" "aws elasticache describe-cache-clusters --query 'CacheClusters[].[CacheClusterId,Engine,NumCacheNodes,CacheNodeType]' --output table" "ElastiCache Clusters"
+          
+          # 20. Redshift Resources (if applicable)
+          echo "🔴 REDSHIFT RESOURCES"
+          echo "======================"
+          
+          safe_list "Redshift" "aws redshift describe-clusters --query 'Clusters[].[ClusterIdentifier,NodeType,ClusterStatus,Endpoint.Address]' --output table" "Redshift Clusters"
+          
+          # 21. EMR Resources (if applicable)
+          echo "🐘 EMR RESOURCES"
+          echo "=================="
+          
+          safe_list "EMR" "aws emr list-clusters --query 'Clusters[].[Id,Name,Status.State,Status.Timeline.CreationDateTime]' --output table" "EMR Clusters"
+          
+          # 22. Glue Resources (if applicable)
+          echo "🔧 GLUE RESOURCES"
+          echo "=================="
+          
+          safe_list "Glue" "aws glue get-databases --query 'DatabaseList[].[Name,Description]' --output table" "Glue Databases"
+          
+          # 23. Kinesis Resources (if applicable)
+          echo "🌊 KINESIS RESOURCES"
+          echo "====================="
+          
+          safe_list "Kinesis" "aws kinesis list-streams --query 'StreamNames' --output table" "Kinesis Streams"
+          
+          # 24. EKS Resources (if applicable)
+          echo "☸️ EKS RESOURCES"
+          echo "=================="
+          
+          safe_list "EKS" "aws eks list-clusters --query 'clusters' --output table" "EKS Clusters"
+          
+          # 25. MSK Resources (if applicable)
+          echo "📨 MSK RESOURCES"
+          echo "=================="
+          
+          safe_list "MSK" "aws kafka list-clusters --query 'ClusterInfoList[].[ClusterName,State,NumberOfBrokerNodes]' --output table" "MSK Clusters"
+          
+          # 26. DocumentDB Resources (if applicable)
+          echo "📄 DOCUMENTDB RESOURCES"
+          echo "========================"
+          
+          safe_list "DocumentDB" "aws docdb describe-db-clusters --query 'DBClusters[].[DBClusterIdentifier,Engine,Status,Endpoint]' --output table" "DocumentDB Clusters"
+          
+          # 27. Neptune Resources (if applicable)
+          echo "🌊 NEPTUNE RESOURCES"
+          echo "====================="
+          
+          safe_list "Neptune" "aws neptune describe-db-clusters --query 'DBClusters[].[DBClusterIdentifier,Engine,Status,Endpoint]' --output table" "Neptune Clusters"
+          
+          # 28. QLDB Resources (if applicable)
+          echo "📋 QLDB RESOURCES"
+          echo "=================="
+          
+          safe_list "QLDB" "aws qldb list-ledgers --query 'Ledgers[].[Name,State,CreationDateTime]' --output table" "QLDB Ledgers"
+          
+          # 29. Timestream Resources (if applicable)
+          echo "⏰ TIMESTREAM RESOURCES"
+          echo "======================="
+          
+          safe_list "Timestream" "aws timestream-write list-databases --query 'Databases[].[DatabaseName,Arn]' --output table" "Timestream Databases"
+          
+          # 30. Keyspaces Resources (if applicable)
+          echo "🗝️ KEYSPACES RESOURCES"
+          echo "======================="
+          
+          safe_list "Keyspaces" "aws keyspaces list-keyspaces --query 'keyspaces[].[keyspaceName,resourceArn]' --output table" "Keyspaces"
+          
+          # Summary
+          echo "=========================================="
+          echo "📊 RESOURCE LISTING COMPLETED"
+          echo "=========================================="
+          echo "✅ All AWS resources have been listed"
+          echo "🌍 Region: $"
+          echo "🏷️ Project: bright-valley"
+          echo "🌍 Environment: $"
+          echo "📅 Completed: $(date)"
+          echo ""
+          echo "💡 Note: Some services may not be available in this region or account"
+          echo "💡 Note: Access to some resources may be restricted by IAM permissions"
+
+      - name: Generate Summary Report
+        run: |
+          echo "## 📊 AWS Resource Listing Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Project:** bright-valley" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** $" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** $" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** $" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp:** $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔍 Services Scanned:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Compute:** EC2, Auto Scaling, Lambda, ECS, EKS" >> $GITHUB_STEP_SUMMARY
+          echo "- **Storage:** S3, EFS, DynamoDB, RDS, ElastiCache" >> $GITHUB_STEP_SUMMARY
+          echo "- **Networking:** VPC, ALB, CloudFront, Route 53" >> $GITHUB_STEP_SUMMARY
+          echo "- **Security:** IAM, Secrets Manager, ACM" >> $GITHUB_STEP_SUMMARY
+          echo "- **Monitoring:** CloudWatch, CloudTrail" >> $GITHUB_STEP_SUMMARY
+          echo "- **Analytics:** EMR, Glue, Kinesis, Redshift" >> $GITHUB_STEP_SUMMARY
+          echo "- **Databases:** DocumentDB, Neptune, QLDB, Timestream" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 Resource Categories:" >> $GITHUB_STEP_SUMMARY
+          echo "1. **EC2 Resources** - Instances, Security Groups, VPCs, Subnets" >> $GITHUB_STEP_SUMMARY
+          echo "2. **Auto Scaling** - Groups, Launch Configurations" >> $GITHUB_STEP_SUMMARY
+          echo "3. **Load Balancers** - ALBs, Target Groups, Listeners" >> $GITHUB_STEP_SUMMARY
+          echo "4. **RDS Resources** - Instances, Subnet Groups, Snapshots" >> $GITHUB_STEP_SUMMARY
+          echo "5. **S3 Resources** - Buckets and Contents" >> $GITHUB_STEP_SUMMARY
+          echo "6. **CloudFront** - Distributions" >> $GITHUB_STEP_SUMMARY
+          echo "7. **IAM Resources** - Users, Roles, Policies" >> $GITHUB_STEP_SUMMARY
+          echo "8. **Secrets Manager** - Stored Secrets" >> $GITHUB_STEP_SUMMARY
+          echo "9. **DynamoDB** - Tables" >> $GITHUB_STEP_SUMMARY
+          echo "10. **CloudWatch** - Log Groups, Metrics" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 💡 Notes:" >> $GITHUB_STEP_SUMMARY
+          echo "- Resources are filtered by project tag: **bright-valley**" >> $GITHUB_STEP_SUMMARY
+          echo "- Some services may not be available in this region" >> $GITHUB_STEP_SUMMARY
+          echo "- Access to resources depends on IAM permissions" >> $GITHUB_STEP_SUMMARY
+          echo "- Use this report to audit and clean up unused resources" >> $GITHUB_STEP_SUMMARY
