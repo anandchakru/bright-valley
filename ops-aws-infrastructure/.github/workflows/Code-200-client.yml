@@ -1,0 +1,129 @@
+name: Code-200-Client
+on:
+  push:
+    branches: [ main, dev ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+  id-token: write
+
+env:
+  TF_VERSION: "1.12.2"
+  AWS_REGION: 
+
+jobs:
+  client-operations:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Version of AWS CLI
+        run: |
+          echo "AWS CLI version:"
+          which aws
+          aws --version
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Env setup
+        run: |
+          if [[ "$" != "main" && "$" != "dev" ]]; then
+            echo "⚠️ Workflow only supports 'main' or 'dev' branches"
+            echo "Current branch: $"
+            echo "Exiting with no-op"
+            exit 0
+          fi
+          
+          # Set environment variables
+          echo "BRANCH=$" >> $GITHUB_ENV
+          if [ "$" = "main" ]; then
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=test" >> $GITHUB_ENV
+          fi
+          
+          echo "✅ Environment setup completed: $"
+
+      - name: Credential for AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam:::role/bright-valley-$-ops-deploy-s3-role
+          aws-region: $
+
+      - name: Setup Environment Info
+        run: |
+          echo "Event name: $"
+          echo "Branch: $"
+          echo "Environment: $"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: $
+          terraform_wrapper: false
+
+      - name: Get Terraform Outputs
+        run: |
+          cd ops/terraform
+          echo "🔍 Getting Terraform outputs for $ environment..."
+          
+          # Initialize Terraform to access state
+          terraform init -backend-config=backend-${ENVIRONMENT}.hcl -input=false
+          
+          # Get the S3 bucket and CloudFront distribution from Terraform outputs
+          S3_BUCKET=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "")
+          CF_DISTRIBUTION=$(terraform output -raw cloudfront_distribution_id 2>/dev/null || echo "")
+          
+          if [ -z "$S3_BUCKET" ]; then
+            echo "❌ Could not get S3 bucket from Terraform outputs"
+            echo "🔍 Available Terraform outputs:"
+            terraform output
+            echo "⚠️ Infrastructure may not be deployed yet - run deploy_apply first"
+            exit 1
+          fi
+          
+          if [ -z "$CF_DISTRIBUTION" ]; then
+            echo "❌ Could not get CloudFront distribution from Terraform outputs"
+            echo "🔍 Available Terraform outputs:"
+            terraform output
+            echo "⚠️ Infrastructure may not be deployed yet - run deploy_apply first"
+            exit 1
+          fi
+          
+          echo "✅ Found S3 bucket: $S3_BUCKET"
+          echo "✅ Found CloudFront distribution: $CF_DISTRIBUTION"
+          echo "AWS_S3_TARGET=$S3_BUCKET" >> $GITHUB_ENV
+          echo "CLOUDFRONT_TARGET=$CF_DISTRIBUTION" >> $GITHUB_ENV
+          
+          echo "Target S3: $S3_BUCKET"
+          echo "Target CloudFront: $CF_DISTRIBUTION"
+        env:
+          AWS_DEFAULT_REGION: $
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: './client/package-lock.json'
+
+      - name: Build
+        run: |
+          cd client
+          node -v
+          npm -v
+          npm install
+          npx update-browserslist-db@latest
+          CI=false npm run "build:$"
+
+      - name: Deploy - Sync S3 Bucket
+        run: |
+          echo "Deploying to ${AWS_S3_TARGET} [${CLOUDFRONT_TARGET}]"
+          aws s3 sync ./client/dist "s3://${AWS_S3_TARGET}" --region $ --delete
+          
+      - name: Deploy - Invalidate CloudFront cache
+        run: |
+          echo "Invalidating CloudFront distribution cache for ${CLOUDFRONT_TARGET}"
+          aws cloudfront create-invalidation --distribution-id "${CLOUDFRONT_TARGET}" --paths "/*"
+
