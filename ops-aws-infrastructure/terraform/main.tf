@@ -1,0 +1,70 @@
+terraform {
+  required_version = ">= 1.5"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.1"
+    }
+    external = {
+      source  = "hashicorp/external"
+      version = "~> 2.0"
+    }
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.0"
+    }
+  }
+
+  backend "s3" {
+    bucket  = "bright-valley-terraform-state"
+    region  = ""
+    encrypt = true
+    # Key and DynamoDB table set via -backend-config during init
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+
+  default_tags {
+    tags = {
+      Project     = "bright-valley"
+      Environment = var.environment
+      ManagedBy   = "terraform"
+    }
+  }
+}
+
+# Provider for ACM certificates (must be us-east-1 for CloudFront)
+provider "aws" {
+  alias  = "us_east_1"
+  region = "us-east-1"
+
+  default_tags {
+    tags = {
+      Project     = "bright-valley"
+      Environment = var.environment
+      ManagedBy   = "terraform"
+    }
+  }
+}
+
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+locals {
+  project_name = "bright-valley"
+  common_tags = {
+    Project     = local.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+
+  # Domain configuration with environment-specific prefix
+  ui_domain = var.environment == "prod" ? "${var.app_id}-ui.${var.domain_base}" : "${var.app_id}-${var.environment}-ui.${var.domain_base}"
+  api_domain = var.environment == "prod" ? "${var.app_id}-api.${var.domain_base}" : "${var.app_id}-${var.environment}-api.${var.domain_base}"
+}
