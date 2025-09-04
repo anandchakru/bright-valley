@@ -1,0 +1,87 @@
+resource "aws_cloudfront_origin_access_control" "client" {
+  name                              = "${local.project_name}-${var.environment}-oac"
+  description                       = "OAC for ${local.project_name} client bucket"
+  origin_access_control_origin_type = "s3"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
+}
+
+resource "aws_cloudfront_distribution" "client" {
+  origin {
+    domain_name              = aws_s3_bucket.client.bucket_regional_domain_name
+    origin_access_control_id = aws_cloudfront_origin_access_control.client.id
+    origin_id                = "S3-${aws_s3_bucket.client.bucket}"
+  }
+
+  enabled             = true
+  is_ipv6_enabled     = true
+  comment             = "${local.project_name} ${var.environment} client distribution"
+  default_root_object = "index.html"
+
+  # Set up aliases - include domains if certificate is available
+  aliases = compact([
+    var.domain_name != "" ? var.domain_name : null,
+    var.certificate_arn != "" ? local.ui_domain : null
+  ])
+
+  default_cache_behavior {
+    allowed_methods        = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "S3-${aws_s3_bucket.client.bucket}"
+    compress               = true
+    viewer_protocol_policy = "redirect-to-https"
+
+    forwarded_values {
+      query_string = false
+      cookies {
+        forward = "none"
+      }
+    }
+
+    min_ttl     = 0
+    default_ttl = 3600
+    max_ttl     = 86400
+  }
+
+  custom_error_response {
+    error_code         = 404
+    response_code      = 200
+    response_page_path = "/index.html"
+  }
+
+  custom_error_response {
+    error_code         = 403
+    response_code      = 200
+    response_page_path = "/index.html"
+  }
+
+  price_class = "PriceClass_100"
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  dynamic "viewer_certificate" {
+    # Use custom certificate only if ARN is provided (validated certificate)
+    for_each = var.certificate_arn != "" ? [1] : []
+    content {
+      acm_certificate_arn      = var.certificate_arn
+      ssl_support_method       = "sni-only"
+      minimum_protocol_version = "TLSv1.2_2021"
+    }
+  }
+
+  dynamic "viewer_certificate" {
+    # Use default CloudFront certificate if no custom certificate provided
+    for_each = var.certificate_arn == "" ? [1] : []
+    content {
+      cloudfront_default_certificate = true
+    }
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.project_name}-${var.environment}-cf-distribution"
+  })
+}
