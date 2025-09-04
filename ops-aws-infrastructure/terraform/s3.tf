@@ -1,0 +1,147 @@
+# Client assets bucket (for CloudFront distribution)
+resource "aws_s3_bucket" "client" {
+  bucket = "${local.project_name}-${var.environment}-client-assets"
+
+  tags = merge(local.common_tags, {
+    Name        = "${local.project_name}-${var.environment}-client"
+    Description = "Static assets for React client"
+  })
+}
+
+# API bucket (for API-related files, uploads, data storage)
+resource "aws_s3_bucket" "api" {
+  bucket = "${local.project_name}-${var.environment}-api"
+
+  tags = merge(local.common_tags, {
+    Name        = "${local.project_name}-${var.environment}-api"
+    Description = "API bucket for application data and uploads"
+    Purpose     = "api"
+  })
+}
+
+# Operations bucket (consolidates deployment artifacts, JAR files, scripts)
+resource "aws_s3_bucket" "ops" {
+  bucket = "${local.project_name}-${var.environment}-ops"
+
+  tags = merge(local.common_tags, {
+    Name        = "${local.project_name}-${var.environment}-ops"
+    Description = "Operations bucket for deployment artifacts and scripts"
+    Purpose     = "ops"
+  })
+}
+
+# Versioning configurations
+resource "aws_s3_bucket_versioning" "client" {
+  bucket = aws_s3_bucket.client.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_versioning" "api" {
+  bucket = aws_s3_bucket.api.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_versioning" "ops" {
+  bucket = aws_s3_bucket.ops.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# Server-side encryption configurations
+resource "aws_s3_bucket_server_side_encryption_configuration" "client" {
+  bucket = aws_s3_bucket.client.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "api" {
+  bucket = aws_s3_bucket.api.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "ops" {
+  bucket = aws_s3_bucket.ops.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# Public access block configurations
+resource "aws_s3_bucket_public_access_block" "client" {
+  bucket = aws_s3_bucket.client.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_public_access_block" "api" {
+  bucket = aws_s3_bucket.api.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_public_access_block" "ops" {
+  bucket = aws_s3_bucket.ops.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# CloudFront access policy for client bucket
+data "aws_iam_policy_document" "client_bucket_policy" {
+  statement {
+    sid    = "AllowCloudFrontAccess"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudfront.amazonaws.com"]
+    }
+
+    actions = [
+      "s3:GetObject"
+    ]
+
+    resources = [
+      "${aws_s3_bucket.client.arn}/*"
+    ]
+
+    condition {
+      test     = "StringEquals"
+      variable = "AWS:SourceArn"
+      values   = [aws_cloudfront_distribution.client.arn]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "client" {
+  bucket = aws_s3_bucket.client.id
+  policy = data.aws_iam_policy_document.client_bucket_policy.json
+
+  depends_on = [aws_s3_bucket_public_access_block.client]
+}
+
