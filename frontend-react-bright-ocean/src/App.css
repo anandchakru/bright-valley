@@ -1,0 +1,84 @@
+/* App-specific styles */
+.App {
+  text-align: center;
+}
+
+/* Toast styles for Radix UI */
+.ToastViewport {
+  --viewport-padding: 25px;
+  position: fixed;
+  bottom: 0;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  padding: var(--viewport-padding);
+  gap: 10px;
+  width: 390px;
+  max-width: 100vw;
+  margin: 0;
+  list-style: none;
+  z-index: 2147483647;
+  outline: none;
+}
+
+.ToastRoot {
+  background-color: white;
+  border-radius: 6px;
+  box-shadow: hsl(206 22% 7% / 35%) 0px 10px 38px -10px, hsl(206 22% 7% / 20%) 0px 10px 20px -15px;
+  padding: 15px;
+  display: grid;
+  grid-template-areas: 'title action' 'description action';
+  grid-template-columns: auto max-content;
+  column-gap: 15px;
+  align-items: center;
+}
+
+.ToastRoot--error {
+  border-left: 4px solid #ef4444;
+  background-color: #fef2f2;
+}
+
+.ToastRoot--success {
+  border-left: 4px solid #10b981;
+  background-color: #f0fdf4;
+}
+
+.ToastRoot--info {
+  border-left: 4px solid #3b82f6;
+  background-color: #eff6ff;
+}
+
+.ToastTitle {
+  grid-area: title;
+  margin-bottom: 5px;
+  font-weight: 500;
+  color: #1f2937;
+  font-size: 15px;
+}
+
+.ToastDescription {
+  grid-area: description;
+  margin: 0;
+  color: #6b7280;
+  font-size: 13px;
+  line-height: 1.3;
+}
+
+.ToastClose {
+  grid-area: action;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: #9ca3af;
+  font-size: 18px;
+  padding: 0;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ToastClose:hover {
+  color: #6b7280;
+}
