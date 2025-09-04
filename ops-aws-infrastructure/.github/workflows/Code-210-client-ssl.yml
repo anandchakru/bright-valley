@@ -1,0 +1,525 @@
+name: Code-210-Client-SSL
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: 
+  AWS_ACCESS_KEY_ID: 
+  DNS_PROVIDER: 
+
+jobs:
+  configure-alternate-domain:
+    name: Configure CloudFront Alternate Domain
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Env setup
+        run: |
+          if [[ "$" != "main" && "$" != "dev" ]]; then
+            echo "⚠️ Workflow only supports 'main' or 'dev' branches"
+            echo "Current branch: $"
+            echo "Exiting with no-op"
+            exit 0
+          fi
+          
+          # Set environment variables
+          echo "BRANCH=$" >> $GITHUB_ENV
+          if [ "$" = "main" ]; then
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=test" >> $GITHUB_ENV
+          fi
+          
+          echo "✅ Environment setup completed: $"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam:::role/bright-valley-terraform-role
+          aws-region: $
+
+      - name: Configure CloudFront Alternate Domain
+        run: |
+          echo "🌐 Configuring CloudFront alternate domain for bright-valley $..."
+          
+          PROJECT_NAME="bright-valley"
+          ENVIRONMENT="$"
+          
+          # Domain construction with environment-specific prefix
+          if [ "${ENVIRONMENT}" = "prod" ]; then
+            UI_DOMAIN="bright-valley-ui.."
+          else
+            UI_DOMAIN="bright-valley-${ENVIRONMENT}-ui.."
+          fi
+          
+          echo "📋 Configuration:"
+          echo "  Project: $PROJECT_NAME"
+          echo "  Environment: $ENVIRONMENT"
+          echo "  UI Domain: $UI_DOMAIN"
+          
+          # Find the CloudFront distribution
+          echo "🔍 Finding CloudFront distribution..."
+          DISTRIBUTION_ID=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Comment=='$PROJECT_NAME $ENVIRONMENT client distribution'].Id" \
+            --output text 2>/dev/null || true)
+          
+          if [ -z "$DISTRIBUTION_ID" ] || [ "$DISTRIBUTION_ID" = "None" ]; then
+            echo "❌ CloudFront distribution not found for $PROJECT_NAME $ENVIRONMENT"
+            echo "Expected comment: '$PROJECT_NAME $ENVIRONMENT client distribution'"
+            exit 1
+          fi
+          
+          echo "✅ Found CloudFront distribution: $DISTRIBUTION_ID"
+          echo "DISTRIBUTION_ID=$DISTRIBUTION_ID" >> $GITHUB_ENV
+          
+          # Check if alternate domain is already configured
+          echo "🔍 Checking current alternate domains..."
+          CURRENT_ALIASES=$(aws cloudfront get-distribution-config --id "$DISTRIBUTION_ID" \
+            --query 'DistributionConfig.Aliases.Items' --output text 2>/dev/null || echo "")
+          
+          echo "Current aliases: $CURRENT_ALIASES"
+          
+          if echo "$CURRENT_ALIASES" | grep -q "$UI_DOMAIN"; then
+            echo "✅ Alternate domain '$UI_DOMAIN' is already configured"
+            exit 0
+          fi
+          
+          # Find ACM certificate for the domain (CloudFront requires us-east-1)
+          echo "🔍 Looking for ACM certificate in us-east-1 (required for CloudFront)..."
+          echo "🔍 Searching for domain: $UI_DOMAIN"
+          
+          # Debug: List all certificates first
+          echo "🔍 DEBUG: All available certificates:"
+          aws acm list-certificates --region us-east-1 --query "CertificateSummaryList[].{Domain:DomainName,SAN:SubjectAlternativeNameSummary,Arn:CertificateArn}" --output table || true
+          
+          CERT_ARN=$(aws acm list-certificates --region us-east-1 \
+            --query "CertificateSummaryList[?DomainName=='$UI_DOMAIN'].CertificateArn" \
+            --output text 2>/dev/null | head -1 || true)
+          
+          # If not found by domain name, search in SAN using a simpler approach
+          if [ -z "$CERT_ARN" ] || [ "$CERT_ARN" = "None" ]; then
+            echo "🔍 Searching in Subject Alternative Names..."
+            # Get all certificates and search manually
+            ALL_CERTS=$(aws acm list-certificates --region us-east-1 --query "CertificateSummaryList[].[CertificateArn,DomainName]" --output text 2>/dev/null || true)
+            while IFS=$'\t' read -r cert_arn cert_domain; do
+              if [ -n "$cert_arn" ]; then
+                # Get detailed certificate info to check SAN
+                SAN_DOMAINS=$(aws acm describe-certificate --certificate-arn "$cert_arn" --region us-east-1 \
+                  --query "Certificate.SubjectAlternativeNames" --output text 2>/dev/null || true)
+                if echo "$SAN_DOMAINS" | grep -q "$UI_DOMAIN"; then
+                  CERT_ARN="$cert_arn"
+                  echo "✅ Found certificate with $UI_DOMAIN in SAN: $CERT_ARN"
+                  break
+                fi
+              fi
+            done <<< "$ALL_CERTS"
+          fi
+          
+          echo "🔍 DEBUG: Query result for exact domain: '$CERT_ARN'"
+          
+          if [ -z "$CERT_ARN" ] || [ "$CERT_ARN" = "None" ]; then
+            echo "⚠️ No ACM certificate found for domain: $UI_DOMAIN"
+            echo "🔍 Looking for wildcard certificate that might cover this domain..."
+            
+            # Check for wildcard certificates
+            WILDCARD_DOMAIN="*.."
+            echo "🔍 Searching for wildcard: $WILDCARD_DOMAIN"
+            
+            CERT_ARN=$(aws acm list-certificates --region us-east-1 \
+              --query "CertificateSummaryList[?DomainName=='$WILDCARD_DOMAIN'].CertificateArn" \
+              --output text 2>/dev/null | head -1 || true)
+            
+            # If not found by domain name, search in SAN manually
+            if [ -z "$CERT_ARN" ] || [ "$CERT_ARN" = "None" ]; then
+              echo "🔍 Searching wildcard in Subject Alternative Names..."
+              ALL_CERTS=$(aws acm list-certificates --region us-east-1 --query "CertificateSummaryList[].[CertificateArn,DomainName]" --output text 2>/dev/null || true)
+              while IFS=$'\t' read -r cert_arn cert_domain; do
+                if [ -n "$cert_arn" ]; then
+                  # Get detailed certificate info to check SAN
+                  SAN_DOMAINS=$(aws acm describe-certificate --certificate-arn "$cert_arn" --region us-east-1 \
+                    --query "Certificate.SubjectAlternativeNames" --output text 2>/dev/null || true)
+                  if echo "$SAN_DOMAINS" | grep -q "$WILDCARD_DOMAIN"; then
+                    CERT_ARN="$cert_arn"
+                    echo "✅ Found certificate with wildcard $WILDCARD_DOMAIN in SAN: $CERT_ARN"
+                    break
+                  fi
+                fi
+              done <<< "$ALL_CERTS"
+            fi
+            
+            echo "🔍 DEBUG: Query result for wildcard: '$CERT_ARN'"
+            
+            if [ -z "$CERT_ARN" ] || [ "$CERT_ARN" = "None" ]; then
+              echo "❌ No suitable certificate found in us-east-1. Please ensure you have a certificate for:"
+              echo "  - $UI_DOMAIN"
+              echo "  - OR $WILDCARD_DOMAIN"
+              echo ""
+              echo "💡 To request a certificate (CloudFront requires us-east-1):"
+              echo "aws acm request-certificate --domain-name '$UI_DOMAIN' --validation-method DNS --region us-east-1"
+              exit 1
+            else
+              echo "✅ Found wildcard certificate: $CERT_ARN"
+            fi
+          else
+            echo "✅ Found certificate for domain: $CERT_ARN"
+          fi
+          
+          # Check certificate status
+          echo "🔍 Checking certificate status..."
+          CERT_STATUS=$(aws acm describe-certificate --certificate-arn "$CERT_ARN" --region us-east-1 \
+            --query 'Certificate.Status' --output text 2>/dev/null || echo "UNKNOWN")
+          
+          echo "Certificate status: $CERT_STATUS"
+          
+          if [ "$CERT_STATUS" = "PENDING_VALIDATION" ]; then
+            echo "⏳ Certificate is pending validation. DNS records needed:"
+            echo ""
+            
+            # Get DNS validation records
+            aws acm describe-certificate --certificate-arn "$CERT_ARN" --region us-east-1 \
+              --query 'Certificate.DomainValidationOptions[].ResourceRecord.{Name:Name,Type:Type,Value:Value}' \
+              --output table 2>/dev/null || true
+            
+            echo ""
+            echo "📋 Action required:"
+            echo "1. Add the CNAME records above to your DNS provider"
+            echo "2. Wait for certificate validation to complete"
+            echo "3. Re-run this workflow"
+            exit 0
+          elif [ "$CERT_STATUS" != "ISSUED" ]; then
+            echo "❌ Certificate is in invalid state: $CERT_STATUS"
+            echo "Expected status: ISSUED"
+            exit 1
+          fi
+          
+          echo "✅ Certificate is valid and issued"
+          
+          # Get current distribution config
+          echo "🔄 Getting current distribution configuration..."
+          aws cloudfront get-distribution-config --id "$DISTRIBUTION_ID" --output json > /tmp/dist-config.json
+          
+          ETAG=$(jq -r '.ETag' /tmp/dist-config.json)
+          echo "Current ETag: $ETAG"
+          
+          # Update distribution config to add alternate domain
+          echo "📝 Adding alternate domain to distribution..."
+          jq --arg domain "$UI_DOMAIN" --arg cert_arn "$CERT_ARN" '
+            .DistributionConfig.Aliases.Quantity = (.DistributionConfig.Aliases.Quantity + 1) |
+            .DistributionConfig.Aliases.Items += [$domain] |
+            .DistributionConfig.ViewerCertificate.CloudFrontDefaultCertificate = false |
+            .DistributionConfig.ViewerCertificate.ACMCertificateArn = $cert_arn |
+            .DistributionConfig.ViewerCertificate.SSLSupportMethod = "sni-only" |
+            .DistributionConfig.ViewerCertificate.MinimumProtocolVersion = "TLSv1.2_2021" |
+            del(.DistributionConfig.ViewerCertificate.CertificateSource)
+          ' /tmp/dist-config.json > /tmp/updated-dist-config.json
+          
+          # Extract just the DistributionConfig for the update
+          jq '.DistributionConfig' /tmp/updated-dist-config.json > /tmp/final-config.json
+          
+          echo "📤 Updating CloudFront distribution..."
+          aws cloudfront update-distribution \
+            --id "$DISTRIBUTION_ID" \
+            --distribution-config file:///tmp/final-config.json \
+            --if-match "$ETAG"
+          
+          echo "⏳ Waiting for distribution update to deploy (this can take 15-20 minutes)..."
+          echo "💡 You can monitor progress in AWS Console: https://console.aws.amazon.com/cloudfront/home?region=$#distribution-settings:$DISTRIBUTION_ID"
+          
+          # Check deployment status periodically with timeout
+          WAIT_COUNT=0
+          MAX_WAIT=60  # 60 checks = ~20 minutes (20 seconds between checks)
+          
+          while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
+            DIST_STATUS=$(aws cloudfront get-distribution --id "$DISTRIBUTION_ID" --query 'Distribution.Status' --output text 2>/dev/null || echo "UNKNOWN")
+            echo "Distribution status: $DIST_STATUS (check $((WAIT_COUNT + 1))/$MAX_WAIT)"
+            
+            if [ "$DIST_STATUS" = "Deployed" ]; then
+              echo "✅ Distribution successfully deployed!"
+              break
+            elif [ "$DIST_STATUS" = "InProgress" ]; then
+              echo "⏳ Still deploying... waiting 20 seconds"
+              sleep 20
+              WAIT_COUNT=$((WAIT_COUNT + 1))
+            else
+              echo "⚠️ Unexpected status: $DIST_STATUS"
+              sleep 20
+              WAIT_COUNT=$((WAIT_COUNT + 1))
+            fi
+          done
+          
+          if [ $WAIT_COUNT -ge $MAX_WAIT ]; then
+            echo "⚠️ Wait timed out after ~20 minutes, but update was initiated successfully"
+            echo "Distribution will continue deploying in the background"
+            echo "Check AWS Console for final status: https://console.aws.amazon.com/cloudfront/home?region=$#distribution-settings:$DISTRIBUTION_ID"
+          fi
+          
+          echo "✅ CloudFront alternate domain configuration completed!"
+          echo ""
+          echo "📋 Summary:"
+          echo "  Distribution ID: $DISTRIBUTION_ID"
+          echo "  Alternate Domain: $UI_DOMAIN"
+          echo "  Certificate: $CERT_ARN"
+          echo ""
+          echo "🌐 Your application will be available at: https://$UI_DOMAIN"
+          echo ""
+          echo "⚠️ Note: DNS propagation may take a few minutes"
+          
+          # Cleanup temp files
+          rm -f /tmp/dist-config.json /tmp/updated-dist-config.json /tmp/final-config.json
+
+      - name: Update Cloudflare DNS for CloudFront
+        run: |
+          echo "🔍 Checking for DNS provider API key..."
+          
+          # Check if DNS_PROVIDER_KEY secret is available
+          if [ -z "$" ]; then
+            echo "⚠️ No DNS_PROVIDER_KEY secret found. Skipping DNS management."
+            exit 0
+          fi
+          
+          # Check if DNS_PROVIDER is set and supported
+          if [ -z "$" ]; then
+            echo "⚠️ DNS_PROVIDER environment variable not set. Skipping DNS management."
+            exit 0
+          fi
+          
+          # Currently only support Cloudflare
+          if [ "$" != "cloudflare" ]; then
+            echo "⚠️ DNS provider '$' not supported. Currently only 'cloudflare' is supported."
+            exit 0
+          fi
+          
+          echo "✅ DNS provider API key found and provider 'cloudflare' is supported"
+          echo "🚀 Attempting to update Cloudflare DNS records..."
+          
+          # Get CloudFront domain from the distribution
+          echo "🔍 Getting CloudFront domain name..."
+          DISTRIBUTION_ID="$"
+          CLOUDFRONT_DOMAIN=$(aws cloudfront get-distribution --id "$DISTRIBUTION_ID" \
+            --query 'Distribution.DomainName' --output text 2>/dev/null || echo "")
+          
+          if [ -z "$CLOUDFRONT_DOMAIN" ] || [ "$CLOUDFRONT_DOMAIN" = "None" ]; then
+            echo "❌ Could not get CloudFront domain name"
+            echo "DISTRIBUTION_ID: '$DISTRIBUTION_ID'"
+            echo "CLOUDFRONT_DOMAIN: '$CLOUDFRONT_DOMAIN'"
+            echo ""
+            echo "🔍 This usually means:"
+            echo "1. The CloudFront distribution doesn't exist"
+            echo "2. There was an issue with the CloudFront configuration"
+            echo "3. The distribution ID is invalid"
+            exit 1
+          fi
+          
+          echo "✅ CloudFront domain: $CLOUDFRONT_DOMAIN"
+          
+          # Domain construction with environment-specific prefix
+          if [ "${ENVIRONMENT}" = "prod" ]; then
+            UI_DOMAIN="bright-valley-ui.."
+          else
+            UI_DOMAIN="bright-valley-${ENVIRONMENT}-ui.."
+          fi
+          DOMAIN_BASE="."
+          
+          echo "📋 DNS Configuration:"
+          echo "  CNAME Name: $UI_DOMAIN"
+          echo "  CNAME Value: $CLOUDFRONT_DOMAIN"
+          echo "  Zone: $DOMAIN_BASE"
+          
+          # Function to check if CNAME record exists in Cloudflare
+          check_cloudflare_record() {
+            local zone_name="$1"
+            local record_name="$2"
+            local api_token="$3"
+            
+            # Get zone ID
+            local zone_id=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$zone_name" \
+              -H "Authorization: Bearer $api_token" \
+              -H "Content-Type: application/json" | jq -r '.result[0].id' 2>/dev/null)
+            
+            if [ "$zone_id" = "null" ] || [ -z "$zone_id" ]; then
+              echo "❌ Could not find Cloudflare zone for: $zone_name"
+              return 1
+            fi
+            
+            # Check if CNAME record exists
+            local existing_record=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records?type=CNAME&name=$record_name" \
+              -H "Authorization: Bearer $api_token" \
+              -H "Content-Type: application/json" | jq -r '.result[0].id' 2>/dev/null)
+            
+            if [ "$existing_record" = "null" ] || [ -z "$existing_record" ]; then
+              echo "false"
+            else
+              echo "true"
+            fi
+          }
+          
+          # Function to get existing CNAME record ID and value
+          get_cloudflare_record_info() {
+            local zone_name="$1"
+            local record_name="$2"
+            local api_token="$3"
+            
+            # Get zone ID
+            local zone_id=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$zone_name" \
+              -H "Authorization: Bearer $api_token" \
+              -H "Content-Type: application/json" | jq -r '.result[0].id' 2>/dev/null)
+            
+            if [ "$zone_id" = "null" ] || [ -z "$zone_id" ]; then
+              echo "❌ Could not find Cloudflare zone for: $zone_name"
+              return 1
+            fi
+            
+            # Get CNAME record details
+            local record_data=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records?type=CNAME&name=$record_name" \
+              -H "Authorization: Bearer $api_token" \
+              -H "Content-Type: application/json" | jq -r '.result[0]' 2>/dev/null)
+            
+            if [ "$record_data" = "null" ] || [ -z "$record_data" ]; then
+              echo "false"
+            else
+              echo "$record_data"
+            fi
+          }
+          
+          # Function to add CNAME record to Cloudflare
+          add_cloudflare_record() {
+            local zone_name="$1"
+            local record_name="$2"
+            local record_value="$3"
+            local api_token="$4"
+            
+            # Get zone ID
+            local zone_id=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$zone_name" \
+              -H "Authorization: Bearer $api_token" \
+              -H "Content-Type: application/json" | jq -r '.result[0].id' 2>/dev/null)
+            
+            if [ "$zone_id" = "null" ] || [ -z "$zone_id" ]; then
+              echo "❌ Could not find Cloudflare zone for: $zone_name"
+              return 1
+            fi
+            
+            # Add CNAME record
+            local response=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records" \
+              -H "Authorization: Bearer $api_token" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"type\": \"CNAME\",
+                \"name\": \"$record_name\",
+                \"content\": \"$record_value\",
+                \"ttl\": 300,
+                \"proxied\": true
+              }")
+            
+            local success=$(echo "$response" | jq -r '.success' 2>/dev/null)
+            if [ "$success" = "true" ]; then
+              echo "✅ Added CNAME record: $record_name -> $record_value"
+              return 0
+            else
+              local error=$(echo "$response" | jq -r '.errors[0].message' 2>/dev/null)
+              echo "❌ Failed to add CNAME record: $error"
+              return 1
+            fi
+          }
+          
+          # Function to update CNAME record in Cloudflare
+          update_cloudflare_record() {
+            local zone_name="$1"
+            local record_id="$2"
+            local record_name="$3"
+            local record_value="$4"
+            local api_token="$5"
+            
+            # Get zone ID
+            local zone_id=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$zone_name" \
+              -H "Authorization: Bearer $api_token" \
+              -H "Content-Type: application/json" | jq -r '.result[0].id' 2>/dev/null)
+            
+            if [ "$zone_id" = "null" ] || [ -z "$zone_id" ]; then
+              echo "❌ Could not find Cloudflare zone for: $zone_name"
+              return 1
+            fi
+            
+            # Update CNAME record
+            local response=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records/$record_id" \
+              -H "Authorization: Bearer $api_token" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"type\": \"CNAME\",
+                \"name\": \"$record_name\",
+                \"content\": \"$record_value\",
+                \"ttl\": 300,
+                \"proxied\": true
+              }")
+            
+            local success=$(echo "$response" | jq -r '.success' 2>/dev/null)
+            if [ "$success" = "true" ]; then
+              echo "✅ Updated CNAME record: $record_name -> $record_value"
+              return 0
+            else
+              local error=$(echo "$response" | jq -r '.errors[0].message' 2>/dev/null)
+              echo "❌ Failed to update CNAME record: $error"
+              return 1
+            fi
+          }
+          
+          # Test Cloudflare API connectivity
+          echo "🔍 Testing Cloudflare API connectivity..."
+          test_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN_BASE" \
+            -H "Authorization: Bearer $" \
+            -H "Content-Type: application/json" 2>/dev/null || echo '{"success":false}')
+          
+          if echo "$test_response" | jq -e '.success' >/dev/null 2>&1; then
+            echo "✅ Cloudflare API connectivity test successful"
+          else
+            echo "❌ Cloudflare API connectivity test failed. Skipping DNS management."
+            exit 0
+          fi
+          
+          # Check if CNAME record exists
+          echo "🔍 Checking if CNAME record exists..."
+          record_exists=$(check_cloudflare_record "$DOMAIN_BASE" "$UI_DOMAIN" "$")
+          
+          if [ "$record_exists" = "true" ]; then
+            echo "✅ CNAME record exists, checking if update is needed..."
+            
+            # Get existing record info
+            record_info=$(get_cloudflare_record_info "$DOMAIN_BASE" "$UI_DOMAIN" "$")
+            
+            if [ "$record_info" != "false" ]; then
+              existing_value=$(echo "$record_info" | jq -r '.content' 2>/dev/null)
+              record_id=$(echo "$record_info" | jq -r '.id' 2>/dev/null)
+              
+              echo "Current CNAME value: $existing_value"
+              echo "New CNAME value: $CLOUDFRONT_DOMAIN"
+              
+              if [ "$existing_value" = "$CLOUDFRONT_DOMAIN" ]; then
+                echo "✅ CNAME record is already up to date"
+              else
+                echo "🔄 Updating CNAME record..."
+                update_cloudflare_record "$DOMAIN_BASE" "$record_id" "$UI_DOMAIN" "$CLOUDFRONT_DOMAIN" "$"
+              fi
+            else
+              echo "⚠️ Could not get existing record info, creating new record..."
+              add_cloudflare_record "$DOMAIN_BASE" "$UI_DOMAIN" "$CLOUDFRONT_DOMAIN" "$"
+            fi
+          else
+            echo "➕ Creating new CNAME record..."
+            add_cloudflare_record "$DOMAIN_BASE" "$UI_DOMAIN" "$CLOUDFRONT_DOMAIN" "$"
+          fi
+          
+          echo "✅ Cloudflare DNS management completed!"
+          echo ""
+          echo "📋 DNS Summary:"
+          echo "  CNAME: $UI_DOMAIN -> $CLOUDFRONT_DOMAIN"
+          echo "  Zone: $DOMAIN_BASE"
+          echo ""
+          echo "🌐 Your application will be available at: https://$UI_DOMAIN"
+          echo "⏳ DNS propagation may take a few minutes"
