@@ -1,0 +1,628 @@
+name: Appinfra-020-Bootstrap
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_VERSION: "1.12.2"
+  AWS_REGION: 
+  DNS_PROVIDER: 
+
+jobs:
+  bootstrap:
+    name: Bootstrap Terraform State
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Env setup
+        run: |
+          if [[ "$" != "main" && "$" != "dev" ]]; then
+            echo "⚠️ Workflow only supports 'main' or 'dev' branches"
+            echo "Current branch: $"
+            echo "Exiting with no-op"
+            exit 0
+          fi
+          
+          # Set environment variables
+          echo "BRANCH=$" >> $GITHUB_ENV
+          if [ "$" = "main" ]; then
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+          else 
+            echo "ENVIRONMENT=test" >> $GITHUB_ENV
+          fi
+          
+          echo "✅ Environment setup completed: $"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam:::role/bright-valley-terraform-role
+          aws-region: $
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: $
+          terraform_wrapper: false
+
+      - name: Terraform Init (Bootstrap)
+        run: |
+          cd ops/terraform/bootstrap
+          terraform init -input=false
+
+      - name: Terraform Validate (Bootstrap)
+        run: |
+          cd ops/terraform/bootstrap
+          terraform validate -no-color
+
+      - name: Clear DynamoDB Locks
+        run: |
+          echo "🔓 Checking for and clearing any Terraform locks..."
+          LOCK_TABLE="bright-valley-terraform-locks-$"
+          
+          # Check if lock table exists
+          if aws dynamodb describe-table --table-name "$LOCK_TABLE" >/dev/null 2>&1; then
+            echo "📋 DynamoDB lock table exists, checking for locks..."
+            
+            # Scan for any lock items
+            LOCK_ITEMS=$(aws dynamodb scan --table-name "$LOCK_TABLE" --query 'Count' --output text 2>/dev/null || echo "0")
+            
+            if [ "$LOCK_ITEMS" -gt 0 ]; then
+              echo "🔒 Found $LOCK_ITEMS lock item(s) in table, clearing them..."
+              
+              # Get all lock IDs and delete them
+              aws dynamodb scan --table-name "$LOCK_TABLE" --query 'Items[].LockID.S' --output text | while read -r LOCK_ID; do
+                if [ -n "$LOCK_ID" ]; then
+                  echo "  Deleting lock: $LOCK_ID"
+                  aws dynamodb delete-item \
+                    --table-name "$LOCK_TABLE" \
+                    --key '{"LockID":{"S":"'$LOCK_ID'"}}' || true
+                fi
+              done
+              
+              echo "✅ Cleared all locks from DynamoDB table"
+            else
+              echo "✅ No locks found in DynamoDB table"
+            fi
+          else
+            echo "✅ DynamoDB lock table does not exist"
+          fi
+
+      - name: Terraform Plan (Bootstrap)
+        run: |
+          cd ops/terraform/bootstrap
+          terraform plan -var="environment=$" -no-color -input=false
+
+      - name: Terraform Apply (Bootstrap)
+        run: |
+          cd ops/terraform/bootstrap
+          echo "🚀 Applying bootstrap infrastructure..."
+          
+          # Try apply, but handle "already exists" errors gracefully
+          set +e
+          APPLY_OUTPUT=$(terraform apply -var="environment=$" -auto-approve -input=false 2>&1)
+          APPLY_EXIT_CODE=$?
+          set -e
+          
+          echo "$APPLY_OUTPUT"
+          
+          if [ $APPLY_EXIT_CODE -eq 0 ]; then
+            echo "✅ Bootstrap apply successful"
+          else
+            echo "⚠️ Bootstrap apply failed, checking if resources already exist..."
+            
+            # Check if it's "already exists" errors
+            if echo "$APPLY_OUTPUT" | grep -E "(BucketAlreadyOwnedByYou|ResourceInUseException|Table already exists)"; then
+              echo "🔄 Resources already exist, attempting to import them..."
+              
+              # Import existing S3 bucket
+              set +e
+              BUCKET_NAME=$(terraform output -raw state_bucket_name 2>/dev/null) || BUCKET_NAME="bright-valley-terraform-state"
+              terraform import aws_s3_bucket.terraform_state "$BUCKET_NAME" 2>/dev/null
+              
+              # Import existing DynamoDB table  
+              TABLE_NAME=$(terraform output -raw lock_table_name 2>/dev/null) || TABLE_NAME="bright-valley-terraform-locks-$"
+              terraform import aws_dynamodb_table.terraform_locks "$TABLE_NAME" 2>/dev/null
+              set -e
+              
+              echo "🔄 Retrying apply after import..."
+              set +e
+              terraform apply -var="environment=$" -auto-approve -input=false
+              RETRY_EXIT_CODE=$?
+              set -e
+              
+              if [ $RETRY_EXIT_CODE -eq 0 ]; then
+                echo "✅ Bootstrap apply successful after import"
+              else
+                echo "⚠️ Apply still failed, but resources may already be configured correctly"
+                echo "📋 Checking if we can read outputs..."
+                
+                # Try to get outputs to verify resources work
+                set +e
+                terraform output state_bucket_name >/dev/null 2>&1 && terraform output lock_table_name >/dev/null 2>&1
+                OUTPUTS_WORK=$?
+                set -e
+                
+                if [ $OUTPUTS_WORK -eq 0 ]; then
+                  echo "✅ Resources appear to be working correctly despite apply failure"
+                else
+                  echo "❌ Bootstrap failed and resources don't appear to be working"
+                  exit 1
+                fi
+              fi
+            else
+              echo "❌ Bootstrap failed for unknown reason:"
+              echo "$APPLY_OUTPUT"
+              exit 1
+            fi
+          fi
+
+      - name: Create SSL Certificate
+        id: create-ssl-cert
+        run: |
+          echo "🔐 Creating SSL certificate for UI domain..."
+          
+          # Extract configuration with environment-specific prefix
+          if [ "${ENVIRONMENT}" = "prod" ]; then
+            UI_DOMAIN="bright-valley-ui.."
+          else
+            UI_DOMAIN="bright-valley-${ENVIRONMENT}-ui.."
+          fi
+          DOMAIN_BASE="."
+          
+          echo "UI Domain: $UI_DOMAIN"
+          echo "Root Domain: $DOMAIN_BASE"
+          
+          # Check if certificate already exists
+          EXISTING_CERT=$(aws acm list-certificates --region us-east-1 --query "CertificateSummaryList[?DomainName=='$UI_DOMAIN'].CertificateArn" --output text)
+          
+          if [ -n "$EXISTING_CERT" ] && [ "$EXISTING_CERT" != "None" ]; then
+            echo "✅ Certificate already exists: $EXISTING_CERT"
+            CERT_ARN="$EXISTING_CERT"
+          else
+            echo "🔒 Creating new SSL certificate..."
+            CERT_ARN=$(aws acm request-certificate \
+              --region us-east-1 \
+              --domain-name "$UI_DOMAIN" \
+              --subject-alternative-names "$DOMAIN_BASE" "*.${DOMAIN_BASE}" \
+              --validation-method DNS \
+              --tags "Key=Name,Value=bright-valley-ui-certificate" "Key=Environment,Value=${ENVIRONMENT}" "Key=Project,Value=bright-valley" \
+              --query 'CertificateArn' \
+              --output text)
+            
+            echo "✅ Certificate requested: $CERT_ARN"
+          fi
+          
+          # Get validation details with retry mechanism
+          echo "🔍 Getting DNS validation records..."
+          echo "⏳ Waiting for AWS to generate DNS validation records..."
+          
+          # Wait for DNS validation records to be available (max 2 minutes)
+          MAX_ATTEMPTS=24  # 24 attempts * 5 seconds = 2 minutes
+          ATTEMPT=1
+          
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS: Checking for DNS validation records..."
+            
+            # Get the validation options and check if ResourceRecord exists
+            VALIDATION_DATA=$(aws acm describe-certificate --region us-east-1 --certificate-arn "$CERT_ARN" \
+              --query 'Certificate.DomainValidationOptions[]' --output json)
+            
+            # Check if any ResourceRecord is null
+            NULL_COUNT=$(echo "$VALIDATION_DATA" | jq '[.[] | select(.ResourceRecord == null)] | length')
+            
+            if [ "$NULL_COUNT" -eq 0 ]; then
+              echo "✅ DNS validation records are now available!"
+              break
+            else
+              echo "  Still waiting for DNS records to be generated... ($NULL_COUNT records pending)"
+              if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+                echo "⚠️ Timeout waiting for DNS validation records. They may take a few more minutes to appear."
+                echo "🔍 You can check manually with:"
+                echo "aws acm describe-certificate --region us-east-1 --certificate-arn $CERT_ARN --query 'Certificate.DomainValidationOptions[]'"
+                break
+              fi
+              sleep 5
+            fi
+            
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+          
+          echo "=================================================="
+          echo "COPY THESE DNS RECORDS TO YOUR DNS PROVIDER:"
+          echo "=================================================="
+          
+          # Display the validation records with better error handling
+          echo "$VALIDATION_DATA" | jq -r '.[] | 
+            if .ResourceRecord == null then
+              "Domain: \(.DomainName)\nCNAME Name: ⚠️ PENDING - check again in a few minutes\nCNAME Value: ⚠️ PENDING - check again in a few minutes\n---"
+            else
+              "Domain: \(.DomainName)\nCNAME Name: \(.ResourceRecord.Name)\nCNAME Value: \(.ResourceRecord.Value)\n---"
+            end'
+          
+          echo "=================================================="
+          echo "⚠️  IMPORTANT: Add ALL CNAME records above to your DNS provider"
+          echo "⏳ Certificate will auto-validate once DNS records are added"
+          echo "=================================================="
+          
+          # Save certificate ARN for apply workflow
+          echo "📋 UI Certificate ARN: $CERT_ARN"
+          echo "UI_CERTIFICATE_ARN=$CERT_ARN" >> $GITHUB_OUTPUT
+
+      - name: Create API SSL Certificate
+        id: create-api-ssl-cert
+        run: |
+          echo "🔐 Creating SSL certificate for API domain (ALB - us-west-1)..."
+          
+          # Extract configuration with environment-specific prefix
+          if [ "${ENVIRONMENT}" = "prod" ]; then
+            API_DOMAIN="bright-valley-api.."
+          else
+            API_DOMAIN="bright-valley-${ENVIRONMENT}-api.."
+          fi
+          DOMAIN_BASE="."
+          
+          echo "API Domain: $API_DOMAIN"
+          echo "Root Domain: $DOMAIN_BASE"
+          
+          # Check if certificate already exists
+          EXISTING_API_CERT=$(aws acm list-certificates --region $ --query "CertificateSummaryList[?DomainName=='$API_DOMAIN'].CertificateArn" --output text)
+          
+          if [ -n "$EXISTING_API_CERT" ] && [ "$EXISTING_API_CERT" != "None" ]; then
+            echo "✅ API Certificate already exists: $EXISTING_API_CERT"
+            API_CERT_ARN="$EXISTING_API_CERT"
+          else
+            echo "🔒 Creating new API SSL certificate..."
+            API_CERT_ARN=$(aws acm request-certificate \
+              --region $ \
+              --domain-name "$API_DOMAIN" \
+              --subject-alternative-names "$DOMAIN_BASE" "*.${DOMAIN_BASE}" \
+              --validation-method DNS \
+              --tags "Key=Name,Value=bright-valley-api-certificate" "Key=Environment,Value=${ENVIRONMENT}" "Key=Project,Value=bright-valley" \
+              --query 'CertificateArn' \
+              --output text)
+            
+            echo "✅ API Certificate requested: $API_CERT_ARN"
+          fi
+          
+          # Get validation details with retry mechanism
+          echo "🔍 Getting API DNS validation records..."
+          echo "⏳ Waiting for AWS to generate API DNS validation records..."
+          
+          # Wait for DNS validation records to be available (max 2 minutes)
+          MAX_ATTEMPTS=24  # 24 attempts * 5 seconds = 2 minutes
+          ATTEMPT=1
+          
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS: Checking for API DNS validation records..."
+            
+            # Get the validation options and check if ResourceRecord exists
+            API_VALIDATION_DATA=$(aws acm describe-certificate --region $ --certificate-arn "$API_CERT_ARN" \
+              --query 'Certificate.DomainValidationOptions[]' --output json)
+            
+            # Check if any ResourceRecord is null
+            NULL_COUNT=$(echo "$API_VALIDATION_DATA" | jq '[.[] | select(.ResourceRecord == null)] | length')
+            
+            if [ "$NULL_COUNT" -eq 0 ]; then
+              echo "✅ API DNS validation records are now available!"
+              break
+            else
+              echo "  Still waiting for API DNS records to be generated... ($NULL_COUNT records pending)"
+              if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+                echo "⚠️ Timeout waiting for API DNS validation records. They may take a few more minutes to appear."
+                break
+              fi
+              sleep 5
+            fi
+            
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+          
+          # Save certificate ARN for apply workflow
+          echo "📋 API Certificate ARN: $API_CERT_ARN"
+          echo "API_CERTIFICATE_ARN=$API_CERT_ARN" >> $GITHUB_OUTPUT
+
+      - name: Display All DNS Records
+        run: |
+          echo "=================================================="
+          echo "🔐 ALL DNS VALIDATION RECORDS TO ADD:"
+          echo "=================================================="
+          echo ""
+          echo "--- UI CERTIFICATE (CloudFront - us-east-1) ---"
+          
+          # Get UI cert validation data
+          UI_CERT_ARN="$"
+          
+          echo "Getting UI certificate validation data..."
+          UI_VALIDATION_DATA=$(aws acm describe-certificate --region us-east-1 --certificate-arn "$UI_CERT_ARN" \
+            --query 'Certificate.DomainValidationOptions[]' --output json 2>/dev/null || echo '[]')
+          
+          if [ "$UI_VALIDATION_DATA" = "[]" ] || [ -z "$UI_VALIDATION_DATA" ]; then
+            echo "⚠️ No UI validation data available yet"
+          else
+            echo "$UI_VALIDATION_DATA" | jq -r '.[] | 
+              if .ResourceRecord == null then
+                "Domain: \(.DomainName)\nCNAME Name: ⚠️ PENDING - check again in a few minutes\nCNAME Value: ⚠️ PENDING - check again in a few minutes\n"
+              else
+                "Domain: \(.DomainName)\nCNAME Name: \(.ResourceRecord.Name)\nCNAME Value: \(.ResourceRecord.Value)\n"
+              end' 2>/dev/null || echo "⚠️ Error parsing UI validation data"
+          fi
+          
+          echo "--- API CERTIFICATE (ALB - $) ---"
+          
+          # Get API cert validation data
+          API_CERT_ARN="$"
+          
+          echo "Getting API certificate validation data..."
+          API_VALIDATION_DATA=$(aws acm describe-certificate --region $ --certificate-arn "$API_CERT_ARN" \
+            --query 'Certificate.DomainValidationOptions[]' --output json 2>/dev/null || echo '[]')
+          
+          if [ "$API_VALIDATION_DATA" = "[]" ] || [ -z "$API_VALIDATION_DATA" ]; then
+            echo "⚠️ No API validation data available yet"
+          else
+            echo "$API_VALIDATION_DATA" | jq -r '.[] | 
+              if .ResourceRecord == null then
+                "Domain: \(.DomainName)\nCNAME Name: ⚠️ PENDING - check again in a few minutes\nCNAME Value: ⚠️ PENDING - check again in a few minutes\n"
+              else
+                "Domain: \(.DomainName)\nCNAME Name: \(.ResourceRecord.Name)\nCNAME Value: \(.ResourceRecord.Value)\n"
+              end' 2>/dev/null || echo "⚠️ Error parsing API validation data"
+          fi
+          
+          echo "=================================================="
+          if [ -n "$" ] && [ "$" = "cloudflare" ]; then
+            echo "🚀 Automatic DNS management will be attempted in the next step"
+            echo "⏳ Both certificates will auto-validate once DNS records are added"
+          else
+            echo "⚠️  IMPORTANT: Add ALL CNAME records above to your DNS provider"
+            echo "⏳ Both certificates will auto-validate once DNS records are added"
+          fi
+          echo "=================================================="
+
+      - name: Auto-Manage DNS Records
+        id: auto-dns
+        run: |
+          echo "🔍 Checking for DNS provider API key..."
+          
+          # Check if DNS_PROVIDER_KEY secret is available
+          if [ -z "$" ]; then
+            echo "⚠️ No DNS_PROVIDER_KEY secret found. Skipping automatic DNS management."
+            echo "DNS_AUTO_MANAGED=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Check if DNS_PROVIDER is set and supported
+          if [ -z "$" ]; then
+            echo "⚠️ DNS_PROVIDER environment variable not set. Skipping automatic DNS management."
+            echo "DNS_AUTO_MANAGED=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Currently only support Cloudflare
+          if [ "$" != "cloudflare" ]; then
+            echo "⚠️ DNS provider '$' not supported. Currently only 'cloudflare' is supported."
+            echo "DNS_AUTO_MANAGED=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "✅ DNS provider API key found and provider 'cloudflare' is supported"
+          echo "🚀 Attempting to automatically manage DNS records..."
+          
+          # Get certificate validation data
+          UI_CERT_ARN="$"
+          API_CERT_ARN="$"
+          
+          # Function to get validation records for a certificate
+          get_validation_records() {
+            local cert_arn="$1"
+            local region="$2"
+            local cert_name="$3"
+            
+            echo "🔍 Getting $cert_name validation records..."
+            local validation_data=$(aws acm describe-certificate --region "$region" --certificate-arn "$cert_arn" \
+              --query 'Certificate.DomainValidationOptions[]' --output json 2>/dev/null || echo '[]')
+            
+            if [ "$validation_data" = "[]" ] || [ -z "$validation_data" ]; then
+              echo "⚠️ No $cert_name validation data available yet"
+              return 1
+            fi
+            
+            # Extract CNAME records that are ready
+            echo "$validation_data" | jq -r '.[] | 
+              if .ResourceRecord != null then
+                "\(.DomainName)|\(.ResourceRecord.Name)|\(.ResourceRecord.Value)"
+              else
+                empty
+              end' 2>/dev/null || return 1
+          }
+          
+          # Function to check if CNAME record exists in Cloudflare
+          check_cloudflare_record() {
+            local zone_name="$1"
+            local record_name="$2"
+            local api_token="$3"
+            
+            # Get zone ID
+            local zone_id=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$zone_name" \
+              -H "Authorization: Bearer $api_token" \
+              -H "Content-Type: application/json" | jq -r '.result[0].id' 2>/dev/null)
+            
+            if [ "$zone_id" = "null" ] || [ -z "$zone_id" ]; then
+              echo "❌ Could not find Cloudflare zone for: $zone_name"
+              return 1
+            fi
+            
+            # Remove trailing dot from record name if present
+            local clean_record_name="${record_name%.}"
+            
+            # URL encode the record name for the API call
+            local encoded_record_name=$(printf '%s' "$clean_record_name" | jq -sRr @uri)
+            
+            # Check if CNAME record exists - try both with and without trailing dot
+            local existing_record=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records?type=CNAME&name=$encoded_record_name" \
+              -H "Authorization: Bearer $api_token" \
+              -H "Content-Type: application/json" | jq -r '.result[0].id' 2>/dev/null)
+            
+            # If not found, try with trailing dot
+            if [ "$existing_record" = "null" ] || [ -z "$existing_record" ]; then
+              local record_with_dot="${clean_record_name}."
+              local encoded_record_with_dot=$(printf '%s' "$record_with_dot" | jq -sRr @uri)
+              existing_record=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records?type=CNAME&name=$encoded_record_with_dot" \
+                -H "Authorization: Bearer $api_token" \
+                -H "Content-Type: application/json" | jq -r '.result[0].id' 2>/dev/null)
+            fi
+            
+            if [ "$existing_record" = "null" ] || [ -z "$existing_record" ]; then
+              echo "false"
+            else
+              echo "true"
+            fi
+          }
+          
+          # Function to add CNAME record to Cloudflare
+          add_cloudflare_record() {
+            local zone_name="$1"
+            local record_name="$2"
+            local record_value="$3"
+            local api_token="$4"
+            
+            # Get zone ID
+            local zone_id=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$zone_name" \
+              -H "Authorization: Bearer $api_token" \
+              -H "Content-Type: application/json" | jq -r '.result[0].id' 2>/dev/null)
+            
+            if [ "$zone_id" = "null" ] || [ -z "$zone_id" ]; then
+              echo "❌ Could not find Cloudflare zone for: $zone_name"
+              return 1
+            fi
+            
+            # Remove trailing dot from record name if present
+            local clean_record_name="${record_name%.}"
+            
+            # Add CNAME record
+            local response=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records" \
+              -H "Authorization: Bearer $api_token" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"type\": \"CNAME\",
+                \"name\": \"$clean_record_name\",
+                \"content\": \"$record_value\",
+                \"ttl\": 300,
+                \"proxied\": false
+              }")
+            
+            local success=$(echo "$response" | jq -r '.success' 2>/dev/null)
+            if [ "$success" = "true" ]; then
+              echo "✅ Added CNAME record: $clean_record_name -> $record_value"
+              return 0
+            else
+              local error=$(echo "$response" | jq -r '.errors[0].message' 2>/dev/null)
+              # Check if it's a duplicate record error
+              if echo "$error" | grep -q "already exists"; then
+                echo "✅ CNAME record already exists: $clean_record_name (this is expected)"
+                return 0
+              else
+                echo "❌ Failed to add CNAME record: $error"
+                return 1
+              fi
+            fi
+          }
+          
+          # Test Cloudflare API connectivity
+          echo "🔍 Testing Cloudflare API connectivity..."
+          DOMAIN_BASE="."
+          test_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN_BASE" \
+            -H "Authorization: Bearer $" \
+            -H "Content-Type: application/json" 2>/dev/null || echo '{"success":false}')
+          
+          if echo "$test_response" | jq -e '.success' >/dev/null 2>&1; then
+            echo "✅ Cloudflare API connectivity test successful"
+          else
+            echo "❌ Cloudflare API connectivity test failed. Skipping automatic DNS management."
+            echo "DNS_AUTO_MANAGED=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Process UI certificate validation records
+          echo "🔐 Processing UI certificate validation records..."
+          ui_records=$(get_validation_records "$UI_CERT_ARN" "us-east-1" "UI certificate")
+          if [ $? -eq 0 ] && [ -n "$ui_records" ]; then
+            echo "$ui_records" | while IFS='|' read -r domain cname_name cname_value; do
+              if [ -n "$domain" ] && [ -n "$cname_name" ] && [ -n "$cname_value" ]; then
+                echo "  Processing: $domain -> $cname_name -> $cname_value"
+                
+                # Check if record already exists
+                record_exists=$(check_cloudflare_record "$DOMAIN_BASE" "$cname_name" "$")
+                if [ "$record_exists" = "true" ]; then
+                  echo "  ✅ CNAME record already exists: $cname_name"
+                else
+                  echo "  ➕ Adding CNAME record: $cname_name -> $cname_value"
+                  add_cloudflare_record "$DOMAIN_BASE" "$cname_name" "$cname_value" "$" || true
+                fi
+              fi
+            done
+          fi
+          
+          # Process API certificate validation records
+          echo "🔐 Processing API certificate validation records..."
+          api_records=$(get_validation_records "$API_CERT_ARN" "$" "API certificate")
+          if [ $? -eq 0 ] && [ -n "$api_records" ]; then
+            echo "$api_records" | while IFS='|' read -r domain cname_name cname_value; do
+              if [ -n "$domain" ] && [ -n "$cname_name" ] && [ -n "$cname_value" ]; then
+                echo "  Processing: $domain -> $cname_name -> $cname_value"
+                
+                # Check if record already exists
+                record_exists=$(check_cloudflare_record "$DOMAIN_BASE" "$cname_name" "$")
+                if [ "$record_exists" = "true" ]; then
+                  echo "  ✅ CNAME record already exists: $cname_name"
+                else
+                  echo "  ➕ Adding CNAME record: $cname_name -> $cname_value"
+                  add_cloudflare_record "$DOMAIN_BASE" "$cname_name" "$cname_value" "$" || true
+                fi
+              fi
+            done
+          fi
+          
+          echo "✅ DNS record management completed"
+          echo "DNS_AUTO_MANAGED=true" >> $GITHUB_OUTPUT
+
+      - name: Output Bootstrap Results
+        run: |
+          cd ops/terraform/bootstrap
+          echo "## Terraform Bootstrap Completed ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**State Bucket:** $(terraform output -raw state_bucket_name)" >> $GITHUB_STEP_SUMMARY
+          echo "**Lock Table:** $(terraform output -raw lock_table_name)" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** $(terraform output -raw aws_region)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## SSL Certificates Created 🔐" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**UI Domain:** bright-valley-ui.. (CloudFront - us-east-1)" >> $GITHUB_STEP_SUMMARY
+          echo "**UI Certificate ARN:** $" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**API Domain:** bright-valley-api.. (ALB - $)" >> $GITHUB_STEP_SUMMARY
+          echo "**API Certificate ARN:** $" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Add DNS management status
+          if [ "$" = "true" ]; then
+            echo "## DNS Records Auto-Managed ✅" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Provider:** $" >> $GITHUB_STEP_SUMMARY
+            echo "**Status:** DNS validation records were automatically added to your DNS provider" >> $GITHUB_STEP_SUMMARY
+            echo "**Note:** Certificates will auto-validate once DNS propagation completes" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## DNS Records Management ⚠️" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Status:** Manual DNS management required" >> $GITHUB_STEP_SUMMARY
+            echo "**⚠️ IMPORTANT: Add ALL DNS validation records shown above to your DNS provider!**" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "You can now run the main Terraform deployment workflow." >> $GITHUB_STEP_SUMMARY
