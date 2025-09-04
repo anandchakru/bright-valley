@@ -1,0 +1,384 @@
+name: Code-300-Server
+on:
+  push:
+    branches: [ main, dev ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+  id-token: write
+
+env:
+  TF_VERSION: "1.12.2"
+  AWS_REGION: 
+
+jobs:
+  server-operations:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Version of AWS CLI
+        run: |
+          echo "AWS CLI version:"
+          which aws
+          aws --version
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Env setup
+        run: |
+          if [[ "$" != "main" && "$" != "dev" ]]; then
+            echo "⚠️ Workflow only supports 'main' or 'dev' branches"
+            echo "Current branch: $"
+            echo "Exiting with no-op"
+            exit 0
+          fi
+          
+          # Set environment variables
+          echo "BRANCH=$" >> $GITHUB_ENV
+          if [ "$" = "main" ]; then
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=test" >> $GITHUB_ENV
+          fi
+          
+          echo "✅ Environment setup completed: $"
+
+      - name: Credential for AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam:::role/bright-valley-$-ops-deploy-ec2-role
+          aws-region: $
+
+      - name: Setup Environment
+        run: |
+          echo "Event name: $"
+          echo "Branch: $"
+          echo "Environment: $"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: $
+          terraform_wrapper: false
+
+      - name: Get Terraform Outputs
+        run: |
+          cd ops/terraform
+          echo "🔍 Getting Terraform outputs for $ environment..."
+          
+          # Initialize Terraform to access state
+          terraform init -backend-config=backend-${ENVIRONMENT}.hcl -input=false
+          
+          # Get the ops bucket name from Terraform outputs
+          OPS_BUCKET=$(terraform output -raw ops_bucket_name 2>/dev/null || echo "")
+          
+          if [ -z "$OPS_BUCKET" ]; then
+            echo "❌ Could not get ops bucket from Terraform outputs"
+            echo "🔍 Available Terraform outputs:"
+            terraform output
+            echo "⚠️ Infrastructure may not be deployed yet - run deploy_apply first"
+            exit 1
+          fi
+          
+          echo "✅ Found ops bucket: $OPS_BUCKET"
+          echo "OPS_BUCKET=$OPS_BUCKET" >> $GITHUB_ENV
+        env:
+          AWS_DEFAULT_REGION: $
+
+      - name: Set Deployment Environment Variables  
+        run: |
+          echo "🔧 Setting up deployment environment variables..."
+          
+          # Set SPRING_PROFILE based on ENVIRONMENT
+          echo "SPRING_PROFILE=$" >> $GITHUB_ENV
+          echo "✅ SPRING_PROFILE set to: $"
+          
+          echo "📋 Environment Variables Set:"
+          echo "  SPRING_PROFILE: $"
+          echo "  OPS_BUCKET: ${OPS_BUCKET}"
+
+      - name: Get EC2 Instances by Tags
+        run: |
+          echo "🔍 Finding EC2 instances by tags..."
+          echo "Looking for instances with Project=bright-valley and Environment=$"
+          
+          # Query EC2 instances by tags
+          EC2_INSTANCES=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Project,Values=bright-valley" \
+              "Name=tag:Environment,Values=$" \
+              "Name=instance-state-name,Values=running" \
+            --query 'Reservations[*].Instances[*].InstanceId' \
+            --output text | tr '\n\t ' ',' | sed 's/,,*/,/g' | sed 's/^,//g' | sed 's/,$//g')
+          
+          if [ -n "${EC2_INSTANCES}" ] && [ "${EC2_INSTANCES}" != "" ]; then
+            echo "EC2_INSTANCES=${EC2_INSTANCES}" >> $GITHUB_ENV
+            echo "✅ Found running instances: ${EC2_INSTANCES}"
+          else
+            echo "❌ No running instances found with tags Project=bright-valley and Environment=$"
+            echo "This could indicate:"
+            echo "  1. Instances are still launching"
+            echo "  2. Instances failed to start properly" 
+            echo "  3. Infrastructure deployment is incomplete"
+            echo ""
+            echo "All instances in environment:"
+            aws ec2 describe-instances \
+              --filters \
+                "Name=tag:Project,Values=bright-valley" \
+                "Name=tag:Environment,Values=$" \
+              --query 'Reservations[*].Instances[*].{InstanceId:InstanceId,State:State.Name,Name:Tags[?Key==`Name`].Value|[0]}' \
+              --output table
+            exit 1
+          fi
+
+      - name: Deploy - Add build info
+        run: |
+          mkdir -p ./server/src/main/resources
+          echo -e "gh.build=$\\ngh.attempt=$\\ngh.action=$\\ngh.modifiedDate=$\\ngh.sha=$( git rev-parse --short HEAD )" > ./server/src/main/resources/git.properties
+
+      - name: Deploy - Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'adopt'
+          java-version: '21'
+
+      - name: Deploy - Setup Gradle
+        uses: gradle/gradle-build-action@v2
+        with:
+          gradle-version: current
+    
+      - name: Deploy - Build Application (with tests)
+        run: |
+          cd server
+          ./gradlew -PversionArg=1.0.$.$ bootJar -x test
+
+      - name: Deploy - Sync JAR to S3
+        run: |
+          JAR_NAME="bright-valley-api-1.0.$.$.jar"
+          echo "📦 Syncing JAR to S3 ops bucket: ${OPS_BUCKET}/jars/"
+          echo "JAR: ${JAR_NAME}"
+          
+          # Verify JAR file exists
+          if [ ! -f "./server/build/libs/${JAR_NAME}" ]; then
+            echo "❌ JAR file not found: ./server/build/libs/${JAR_NAME}"
+            echo "📁 Available files in ./server/build/libs/:"
+            ls -la ./server/build/libs/ || echo "Directory not found"
+            exit 1
+          fi
+          
+          # Show JAR file info
+          echo "📋 JAR file details:"
+          ls -lh "./server/build/libs/${JAR_NAME}"
+          
+          # Create a staging directory for sync
+          mkdir -p ./staging/jars
+          cp "./server/build/libs/${JAR_NAME}" "./staging/jars/"
+          
+          # Sync the staging/jars directory to S3
+          echo "🚀 Syncing JAR to S3..."
+          if aws s3 sync ./staging/jars/ "s3://${OPS_BUCKET}/jars/" --region $; then
+            echo "✅ Successfully synced JAR to S3 ops bucket"
+            echo "JAR_NAME=${JAR_NAME}" >> $GITHUB_ENV
+            
+            # Verify what was uploaded
+            echo "🔍 Verifying uploaded JAR:"
+            aws s3 ls "s3://${OPS_BUCKET}/jars/${JAR_NAME}" --region $
+            
+            # Clean up staging directory
+            rm -rf ./staging
+          else
+            echo "❌ Failed to sync JAR to S3 ops bucket: ${OPS_BUCKET}"
+            rm -rf ./staging
+            exit 1
+          fi
+
+      - name: Deploy - Sync EC2 Setup Scripts to S3
+        run: |
+          echo "📋 Syncing latest EC2 setup scripts from Git to S3..."
+          echo "Source: ./ops/ec2-setup/"
+          echo "Target: s3://${OPS_BUCKET}/ec2-setup/"
+          
+          # Verify source directory exists
+          if [ ! -d "./ops/ec2-setup" ]; then
+            echo "❌ Source directory ./ops/ec2-setup not found"
+            exit 1
+          fi
+          
+          # Show what we're about to sync
+          echo "📁 Files to sync:"
+          ls -la ./ops/ec2-setup/
+          
+          # Sync ec2-setup directory to S3 (this will overwrite existing files)
+          if aws s3 sync ./ops/ec2-setup/ "s3://${OPS_BUCKET}/ec2-setup/" --delete --region $; then
+            echo "✅ Successfully synced EC2 setup scripts to S3"
+            
+            # Verify what was uploaded
+            echo "🔍 Verifying uploaded files:"
+            aws s3 ls "s3://${OPS_BUCKET}/ec2-setup/" --region $
+          else
+            echo "❌ Failed to sync EC2 setup scripts to S3"
+            exit 1
+          fi
+
+      - name: Deploy - Copy EC2 Setup Scripts and Initialize
+        run: |
+          echo "🔧 Preparing EC2 instances with setup scripts..."
+          
+          # Convert comma-separated instances to space-separated for AWS CLI
+          INSTANCE_LIST=$(echo "${EC2_INSTANCES}" | tr ',' ' ')
+          echo "Target instances: ${INSTANCE_LIST}"
+          
+          # Copy ec2-setup scripts from S3 and run init.sh
+          echo "📋 Copying EC2 setup scripts and initializing instances..."
+          INIT_COMMAND_ID=$(aws ssm send-command \
+            --instance-ids ${INSTANCE_LIST} \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "echo \"=== Syncing EC2 setup scripts from S3 ===\"",
+              "sudo mkdir -p /opt/bright-valley/ec2-setup",
+              "aws s3 sync s3://'${OPS_BUCKET}'/ec2-setup/ /opt/bright-valley/ec2-setup/ --region '${AWS_REGION}'",
+              "sudo chmod +x /opt/bright-valley/ec2-setup/*.sh",
+              "echo \"=== Running initialization script ===\"",
+              "sudo /opt/bright-valley/ec2-setup/init.sh '${JAR_NAME}' '${SPRING_PROFILE}'"
+            ]' \
+            --timeout-seconds 1800 \
+            --query 'Command.CommandId' \
+            --output text)
+          
+          echo "EC2 Setup Command ID: ${INIT_COMMAND_ID}"
+          
+          echo "⏳ Waiting for EC2 setup and initialization to complete..."
+          
+          # Convert instances to array for status checking
+          IFS=' ' read -ra INSTANCE_ARRAY <<< "${INSTANCE_LIST}"
+          
+          # Wait for command completion on all instances
+          for i in {1..120}; do
+            ALL_COMPLETE=true
+            ALL_SUCCESS=true
+            
+            echo "=== Checking initialization status (attempt ${i}/120) ==="
+            
+            for INSTANCE in "${INSTANCE_ARRAY[@]}"; do
+              # Trim whitespace
+              INSTANCE=$(echo "${INSTANCE}" | xargs)
+              
+              STATUS=$(aws ssm get-command-invocation \
+                --command-id "${INIT_COMMAND_ID}" \
+                --instance-id "${INSTANCE}" \
+                --query 'Status' \
+                --output text 2>/dev/null || echo "InProgress")
+              
+              echo "📊 Instance ${INSTANCE}: ${STATUS}"
+              
+              if [ "${STATUS}" = "Failed" ]; then
+                echo "❌ Initialization failed on instance ${INSTANCE}"
+                echo "=== Error Output for ${INSTANCE} ==="
+                aws ssm get-command-invocation \
+                  --command-id "${INIT_COMMAND_ID}" \
+                  --instance-id "${INSTANCE}" \
+                  --query 'StandardErrorContent' \
+                  --output text
+                echo "=== Standard Output for ${INSTANCE} ==="
+                aws ssm get-command-invocation \
+                  --command-id "${INIT_COMMAND_ID}" \
+                  --instance-id "${INSTANCE}" \
+                  --query 'StandardOutputContent' \
+                  --output text
+                exit 1
+              elif [ "${STATUS}" != "Success" ]; then
+                ALL_SUCCESS=false
+                if [ "${STATUS}" = "InProgress" ]; then
+                  ALL_COMPLETE=false
+                fi
+              fi
+            done
+            
+            if [ "${ALL_SUCCESS}" = "true" ]; then
+              echo "✅ Initialization completed successfully on all instances"
+              
+              # Show successful output from all instances
+              echo "🔍 Initialization results:"
+              for INSTANCE in "${INSTANCE_ARRAY[@]}"; do
+                INSTANCE=$(echo "${INSTANCE}" | xargs)
+                echo "📋 Instance ${INSTANCE} initialization output (last 20 lines):"
+                aws ssm get-command-invocation \
+                  --command-id "${INIT_COMMAND_ID}" \
+                  --instance-id "${INSTANCE}" \
+                  --query 'StandardOutputContent' \
+                  --output text | tail -n 20
+                echo
+              done
+              break
+            fi
+            
+            if [ "${ALL_COMPLETE}" = "true" ]; then
+              echo "❌ Some instances completed but not all succeeded"
+              exit 1
+            fi
+            
+            sleep 15
+          done
+          
+          # If we reach here without success, it timed out
+          if [ "${ALL_SUCCESS}" != "true" ]; then
+            echo "❌ Initialization timed out after 30 minutes"
+            # Show any available output even on timeout
+            for INSTANCE in "${INSTANCE_ARRAY[@]}"; do
+              INSTANCE=$(echo "${INSTANCE}" | xargs)
+              echo "--- Instance ${INSTANCE} Output ---"
+              aws ssm get-command-invocation \
+                --command-id "${INIT_COMMAND_ID}" \
+                --instance-id "${INSTANCE}" \
+                --query 'StandardOutputContent' \
+                --output text || true
+              echo "--- Instance ${INSTANCE} Errors ---"
+              aws ssm get-command-invocation \
+                --command-id "${INIT_COMMAND_ID}" \
+                --instance-id "${INSTANCE}" \
+                --query 'StandardErrorContent' \
+                --output text || true
+              echo
+            done
+            exit 1
+          fi
+          echo "✅ EC2 setup and initialization completed"
+          echo "🎉 Deployment to $ environment completed successfully!"
+          echo "📋 Summary:"
+          echo "  - JAR: ${JAR_NAME}"
+          echo "  - Environment: $"
+          echo "  - Spring Profile: ${SPRING_PROFILE}"
+          echo "  - Instances: ${EC2_INSTANCES}"
+          echo "  - Service: bright-valley-api.service"
+
+      - name: Enable ALB Health Checks
+        run: |
+          echo "🔍 Checking if ALB health checks are already enabled..."
+          
+          # Check current health check type
+          CURRENT_HEALTH_CHECK=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "bright-valley-$-asg" \
+            --query 'AutoScalingGroups[0].HealthCheckType' \
+            --output text 2>/dev/null || echo "NONE")
+          
+          echo "Current health check type: ${CURRENT_HEALTH_CHECK}"
+          
+          if [ "${CURRENT_HEALTH_CHECK}" = "ELB" ]; then
+            echo "✅ ALB health checks are already enabled"
+            echo "🔍 Current ASG health check configuration:"
+            aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "bright-valley-$-asg" \
+              --query 'AutoScalingGroups[0].{HealthCheckType:HealthCheckType,HealthCheckGracePeriod:HealthCheckGracePeriod}' \
+              --output table
+          else
+            echo "🔄 Enabling ALB health checks for Auto Scaling Group..."
+            
+            # Run the enable health checks script
+            cd ops/helper
+            chmod +x enable-health-checks.sh
+            ./enable-health-checks.sh $
+            
+            echo "✅ ALB health checks enabled successfully!"
+          fi
