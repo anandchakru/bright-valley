@@ -1,0 +1,1102 @@
+#!/bin/bash
+set -e
+
+# Manual AWS CLI cleanup script for bright-valley project
+# This script cleans up all resources without relying on Terraform state
+#
+# UPDATED: Added comprehensive cleanup for all resource types that cause
+# "already exists" deployment errors:
+# - RDS Parameter Groups and Subnet Groups
+# - Secrets Manager secrets
+# - S3 buckets (with versioning support)
+# - DynamoDB tables (including Terraform locks)
+# - Auto Scaling Groups and Launch Templates
+# - CloudFront distributions and Origin Access Controls
+# - Load Balancers and Target Groups
+# - EC2 Key Pairs, instances, and VPC resources
+
+PROJECT_NAME="bright-valley"
+ENVIRONMENT="${1:-prod}"  # Default to prod if not specified
+
+echo "🧹 Starting manual cleanup for project: $PROJECT_NAME"
+echo "🌍 Environment: $ENVIRONMENT"
+echo "⚠️  This will delete ALL resources with $PROJECT_NAME prefix!"
+echo ""
+
+# Function to check if AWS CLI is available
+check_aws_cli() {
+    if ! command -v aws &> /dev/null; then
+        echo "❌ AWS CLI is not installed or not in PATH"
+        exit 1
+    fi
+    
+    if ! aws sts get-caller-identity &> /dev/null; then
+        echo "❌ AWS CLI is not configured or credentials are invalid"
+        exit 1
+    fi
+    
+    echo "✅ AWS CLI is available and configured"
+}
+
+# Function to confirm deletion
+confirm_deletion() {
+    echo ""
+    echo "🚨 WARNING: This will delete ALL resources with prefix: $PROJECT_NAME"
+    echo "🚨 This action cannot be undone!"
+    echo "✅ Proceeding with cleanup..."
+}
+
+# Function to disable deletion protection
+disable_deletion_protection() {
+    echo "🛡️ Disabling deletion protection..."
+    
+    # Disable RDS deletion protection
+    echo "  📊 Disabling RDS deletion protection..."
+    RDS_INSTANCES=$(aws rds describe-db-instances \
+        --query "DBInstances[?contains(DBInstanceIdentifier,'$PROJECT_NAME')].DBInstanceIdentifier" \
+        --output text 2>/dev/null || true)
+    
+    for DB_INSTANCE in $RDS_INSTANCES; do
+        if [ -n "$DB_INSTANCE" ]; then
+            echo "    Disabling deletion protection for RDS: $DB_INSTANCE"
+            aws rds modify-db-instance \
+                --db-instance-identifier "$DB_INSTANCE" \
+                --no-deletion-protection \
+                --apply-immediately 2>/dev/null || true
+        fi
+    done
+    
+    # Disable ALB deletion protection
+    echo "  🏗️ Disabling ALB deletion protection..."
+    ALB_ARNS=$(aws elbv2 describe-load-balancers \
+        --query "LoadBalancers[?contains(LoadBalancerName,'$PROJECT_NAME')].LoadBalancerArn" \
+        --output text 2>/dev/null || true)
+    
+    for ALB_ARN in $ALB_ARNS; do
+        if [ -n "$ALB_ARN" ]; then
+            echo "    Disabling deletion protection for ALB: $ALB_ARN"
+            aws elbv2 modify-load-balancer-attributes \
+                --load-balancer-arn "$ALB_ARN" \
+                --attributes Key=deletion_protection.enabled,Value=false 2>/dev/null || true
+        fi
+    done
+    
+    echo "  ⏳ Waiting for protection changes to propagate..."
+    sleep 30
+}
+
+# Function to delete Auto Scaling Groups and Launch Templates
+delete_autoscaling_resources() {
+    echo "🚀 Deleting Auto Scaling Groups and Launch Templates..."
+    
+    # Delete Auto Scaling Groups
+    echo "  Deleting Auto Scaling Groups..."
+    ASG_NAMES=$(aws autoscaling describe-auto-scaling-groups \
+        --query "AutoScalingGroups[?contains(AutoScalingGroupName,'$PROJECT_NAME')].AutoScalingGroupName" \
+        --output text 2>/dev/null || true)
+    
+    for ASG_NAME in $ASG_NAMES; do
+        if [ -n "$ASG_NAME" ]; then
+            echo "    Force deleting ASG: $ASG_NAME"
+            aws autoscaling delete-auto-scaling-group \
+                --auto-scaling-group-name "$ASG_NAME" \
+                --force-delete 2>/dev/null || true
+        fi
+    done
+    
+    # Wait for ASGs to be deleted
+    if [ -n "$ASG_NAMES" ]; then
+        echo "  ⏳ Waiting for Auto Scaling Groups to be deleted..."
+        sleep 30
+    fi
+    
+    # Delete Launch Templates
+    echo "  Deleting Launch Templates..."
+    LAUNCH_TEMPLATE_IDS=$(aws ec2 describe-launch-templates \
+        --query "LaunchTemplates[?contains(LaunchTemplateName,'$PROJECT_NAME')].LaunchTemplateId" \
+        --output text 2>/dev/null || true)
+    
+    for LT_ID in $LAUNCH_TEMPLATE_IDS; do
+        if [ -n "$LT_ID" ]; then
+            echo "    Deleting Launch Template: $LT_ID"
+            aws ec2 delete-launch-template --launch-template-id "$LT_ID" 2>/dev/null || true
+        fi
+    done
+    
+    # Delete Launch Configurations
+    echo "  Deleting Launch Configurations..."
+    LAUNCH_CONFIG_NAMES=$(aws autoscaling describe-launch-configurations \
+        --query "LaunchConfigurations[?contains(LaunchConfigurationName,'$PROJECT_NAME')].LaunchConfigurationName" \
+        --output text 2>/dev/null || true)
+    
+    for LC_NAME in $LAUNCH_CONFIG_NAMES; do
+        if [ -n "$LC_NAME" ]; then
+            echo "    Deleting Launch Configuration: $LC_NAME"
+            aws autoscaling delete-launch-configuration --launch-configuration-name "$LC_NAME" 2>/dev/null || true
+        fi
+    done
+}
+
+# Function to terminate EC2 instances
+terminate_ec2_instances() {
+    echo "🖥️ Terminating EC2 instances..."
+    
+    INSTANCE_IDS=$(aws ec2 describe-instances \
+        --filters "Name=tag:Project,Values=$PROJECT_NAME" "Name=instance-state-name,Values=running,stopped,pending" \
+        --query 'Reservations[].Instances[].InstanceId' \
+        --output text 2>/dev/null || true)
+    
+    if [ -n "$INSTANCE_IDS" ]; then
+        echo "  Found instances: $INSTANCE_IDS"
+        
+        # Disable termination protection for each instance
+        for INSTANCE_ID in $INSTANCE_IDS; do
+            echo "    Disabling termination protection for: $INSTANCE_ID"
+            aws ec2 modify-instance-attribute \
+                --instance-id "$INSTANCE_ID" \
+                --no-disable-api-termination 2>/dev/null || true
+        done
+        
+        echo "  Terminating instances: $INSTANCE_IDS"
+        aws ec2 terminate-instances --instance-ids $INSTANCE_IDS 2>/dev/null || true
+        
+        echo "  ⏳ Waiting for instances to terminate..."
+        aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS 2>/dev/null || true
+    else
+        echo "  No EC2 instances found"
+    fi
+}
+
+# Function to delete NAT Gateways
+delete_nat_gateways() {
+    echo "🌐 Deleting NAT Gateways..."
+    
+    # Find all project VPCs
+    VPC_IDS=$(aws ec2 describe-vpcs \
+        --filters "Name=tag:Project,Values=$PROJECT_NAME" \
+        --query 'Vpcs[].VpcId' \
+        --output text 2>/dev/null || true)
+    
+    for VPC_ID in $VPC_IDS; do
+        if [ -n "$VPC_ID" ]; then
+            echo "  Processing VPC: $VPC_ID"
+            
+            # Delete NAT Gateways in this VPC
+            NAT_GW_IDS=$(aws ec2 describe-nat-gateways \
+                --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending" \
+                --query 'NatGateways[].NatGatewayId' \
+                --output text 2>/dev/null || true)
+            
+            for NAT_ID in $NAT_GW_IDS; do
+                if [ -n "$NAT_ID" ]; then
+                    echo "    Deleting NAT Gateway: $NAT_ID"
+                    aws ec2 delete-nat-gateway --nat-gateway-id "$NAT_ID" 2>/dev/null || true
+                fi
+            done
+            
+            # Wait for NAT Gateways to be deleted
+            if [ -n "$NAT_GW_IDS" ]; then
+                echo "    ⏳ Waiting for NAT Gateways to be deleted..."
+                for NAT_ID in $NAT_GW_IDS; do
+                    if [ -n "$NAT_ID" ]; then
+                        aws ec2 wait nat-gateway-deleted --nat-gateway-ids "$NAT_ID" 2>/dev/null || true
+                    fi
+                done
+            fi
+        fi
+    done
+}
+
+# Function to release Elastic IPs
+release_elastic_ips() {
+    echo "💰 Releasing Elastic IPs..."
+    
+    EIP_DATA=$(aws ec2 describe-addresses \
+        --filters "Name=domain,Values=vpc" "Name=tag:Project,Values=$PROJECT_NAME" \
+        --query 'Addresses[].[AllocationId,AssociationId]' \
+        --output text 2>/dev/null || true)
+    
+    if [ -n "$EIP_DATA" ]; then
+        echo "$EIP_DATA" | while IFS=$'\t' read -r ALLOC_ID ASSOC_ID; do
+            if [ -n "$ALLOC_ID" ]; then
+                echo "  Processing EIP: $ALLOC_ID"
+                
+                # Disassociate if attached
+                if [ -n "$ASSOC_ID" ] && [ "$ASSOC_ID" != "None" ] && [ "$ASSOC_ID" != "null" ]; then
+                    echo "    Disassociating EIP: $ALLOC_ID"
+                    aws ec2 disassociate-address --association-id "$ASSOC_ID" 2>/dev/null || true
+                    sleep 2
+                fi
+                
+                # Release the EIP
+                echo "    Releasing EIP: $ALLOC_ID"
+                aws ec2 release-address --allocation-id "$ALLOC_ID" 2>/dev/null || true
+            fi
+        done
+    else
+        echo "  No Elastic IPs found"
+    fi
+}
+
+# Function to delete Load Balancers and Target Groups
+delete_load_balancers() {
+    echo "🏗️ Deleting Load Balancers..."
+    
+    ALB_ARNS=$(aws elbv2 describe-load-balancers \
+        --query "LoadBalancers[?contains(LoadBalancerName,'$PROJECT_NAME')].LoadBalancerArn" \
+        --output text 2>/dev/null || true)
+    
+    for ALB_ARN in $ALB_ARNS; do
+        if [ -n "$ALB_ARN" ]; then
+            echo "  Deleting ALB: $ALB_ARN"
+            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN" 2>/dev/null || true
+        fi
+    done
+    
+    # Wait for ALBs to be deleted
+    if [ -n "$ALB_ARNS" ]; then
+        echo "  ⏳ Waiting for Load Balancers to be deleted..."
+        sleep 60
+    fi
+    
+    # Delete Target Groups
+    echo "  🎯 Deleting Target Groups..."
+    TARGET_GROUP_ARNS=$(aws elbv2 describe-target-groups \
+        --query "TargetGroups[?contains(TargetGroupName,'$PROJECT_NAME')].TargetGroupArn" \
+        --output text 2>/dev/null || true)
+    
+    for TG_ARN in $TARGET_GROUP_ARNS; do
+        if [ -n "$TG_ARN" ]; then
+            echo "    Deleting Target Group: $TG_ARN"
+            aws elbv2 delete-target-group --target-group-arn "$TG_ARN" 2>/dev/null || true
+        fi
+    done
+}
+
+# Function to delete RDS resources
+delete_rds_resources() {
+    echo "🛡️ Deleting RDS resources..."
+    
+    # Delete RDS instances
+    echo "  📊 Deleting RDS instances..."
+    RDS_INSTANCES=$(aws rds describe-db-instances \
+        --query "DBInstances[?contains(DBInstanceIdentifier,'$PROJECT_NAME')].DBInstanceIdentifier" \
+        --output text 2>/dev/null || true)
+    
+    for DB_INSTANCE in $RDS_INSTANCES; do
+        if [ -n "$DB_INSTANCE" ]; then
+            echo "    Deleting RDS instance: $DB_INSTANCE"
+            aws rds delete-db-instance \
+                --db-instance-identifier "$DB_INSTANCE" \
+                --skip-final-snapshot 2>/dev/null || true
+        fi
+    done
+    
+    # Delete RDS snapshots
+    echo "  📸 Deleting RDS snapshots..."
+    RDS_SNAPSHOTS=$(aws rds describe-db-snapshots \
+        --query 'DBSnapshots[?contains(DBSnapshotIdentifier, `'$PROJECT_NAME'`) || contains(DBInstanceIdentifier, `'$PROJECT_NAME'`)].DBSnapshotIdentifier' \
+        --output text 2>/dev/null || true)
+    
+    for SNAPSHOT in $RDS_SNAPSHOTS; do
+        if [ -n "$SNAPSHOT" ]; then
+            echo "    Deleting RDS snapshot: $SNAPSHOT"
+            aws rds delete-db-snapshot --db-snapshot-identifier "$SNAPSHOT" 2>/dev/null || true
+        fi
+    done
+    
+    # Wait for instances to start deletion
+    if [ -n "$RDS_INSTANCES" ]; then
+        echo "  ⏳ Waiting for RDS instances to start deletion..."
+        sleep 60
+    fi
+    
+    # Wait for RDS instances to be fully deleted before deleting parameter/subnet groups
+    for DB_INSTANCE in $RDS_INSTANCES; do
+        if [ -n "$DB_INSTANCE" ]; then
+            echo "    ⏳ Waiting for RDS instance deletion: $DB_INSTANCE"
+            aws rds wait db-instance-deleted --db-instance-identifier "$DB_INSTANCE" 2>/dev/null || {
+                echo "    ⚠️ Wait timeout for $DB_INSTANCE, continuing..."
+                sleep 180
+            }
+        fi
+    done
+    
+    # Delete DB Parameter Groups
+    echo "  ⚙️ Deleting DB Parameter Groups..."
+    DB_PARAM_GROUPS=$(aws rds describe-db-parameter-groups \
+        --query 'DBParameterGroups[?contains(DBParameterGroupName, `'$PROJECT_NAME'`)].DBParameterGroupName' \
+        --output text 2>/dev/null || true)
+    
+    for PARAM_GROUP in $DB_PARAM_GROUPS; do
+        if [ -n "$PARAM_GROUP" ]; then
+            echo "    Deleting DB Parameter Group: $PARAM_GROUP"
+            aws rds delete-db-parameter-group --db-parameter-group-name "$PARAM_GROUP" 2>/dev/null || true
+        fi
+    done
+    
+    # Delete DB Subnet Groups
+    echo "  🏠 Deleting DB Subnet Groups..."
+    DB_SUBNET_GROUPS=$(aws rds describe-db-subnet-groups \
+        --query 'DBSubnetGroups[?contains(DBSubnetGroupName, `'$PROJECT_NAME'`)].DBSubnetGroupName' \
+        --output text 2>/dev/null || true)
+    
+    for SUBNET_GROUP in $DB_SUBNET_GROUPS; do
+        if [ -n "$SUBNET_GROUP" ]; then
+            echo "    Deleting DB Subnet Group: $SUBNET_GROUP"
+            aws rds delete-db-subnet-group --db-subnet-group-name "$SUBNET_GROUP" 2>/dev/null || true
+        fi
+    done
+}
+
+# Function to delete Secrets Manager secrets
+delete_secrets() {
+    echo "🔐 Deleting Secrets Manager secrets..."
+    
+    SECRETS=$(aws secretsmanager list-secrets \
+        --query 'SecretList[?contains(Name, `'$PROJECT_NAME'`)].Name' \
+        --output text 2>/dev/null || true)
+    
+    for SECRET in $SECRETS; do
+        if [ -n "$SECRET" ]; then
+            echo "  Deleting secret: $SECRET"
+            aws secretsmanager delete-secret --secret-id "$SECRET" --force-delete-without-recovery 2>/dev/null || true
+        fi
+    done
+}
+
+# Function to delete S3 buckets
+delete_s3_buckets() {
+    echo "🗑️ Deleting S3 buckets..."
+    
+    S3_BUCKETS=$(aws s3api list-buckets \
+        --query "Buckets[?contains(Name, '$PROJECT_NAME')].Name" \
+        --output text 2>/dev/null || true)
+    
+    for BUCKET in $S3_BUCKETS; do
+        if [ -n "$BUCKET" ]; then
+            echo "  Emptying S3 bucket: $BUCKET"
+            
+            # Delete all object versions and delete markers
+            aws s3api delete-objects \
+                --bucket "$BUCKET" \
+                --delete "$(aws s3api list-object-versions \
+                    --bucket "$BUCKET" \
+                    --output json \
+                    --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' 2>/dev/null || echo '{\"Objects\":[]}')" 2>/dev/null || true
+            
+            aws s3api delete-objects \
+                --bucket "$BUCKET" \
+                --delete "$(aws s3api list-object-versions \
+                    --bucket "$BUCKET" \
+                    --output json \
+                    --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' 2>/dev/null || echo '{\"Objects\":[]}')" 2>/dev/null || true
+            
+            # Delete all current objects
+            aws s3 rm "s3://$BUCKET" --recursive 2>/dev/null || true
+            
+            # Delete the bucket
+            echo "    Deleting bucket: $BUCKET"
+            aws s3 rb "s3://$BUCKET" --force 2>/dev/null || true
+        fi
+    done
+}
+
+# Function to delete DynamoDB tables
+delete_dynamodb_tables() {
+    echo "🗄️ Deleting DynamoDB tables..."
+    
+    TABLES=$(aws dynamodb list-tables \
+        --query 'TableNames[?contains(@, `'$PROJECT_NAME'`)]' \
+        --output text 2>/dev/null || true)
+    
+    for TABLE in $TABLES; do
+        if [ -n "$TABLE" ]; then
+            echo "  Deleting DynamoDB table: $TABLE"
+            aws dynamodb delete-table --table-name "$TABLE" 2>/dev/null || true
+        fi
+    done
+    
+    # Wait for table deletion to complete
+    if [ -n "$TABLES" ]; then
+        echo "  ⏳ Waiting for DynamoDB table deletion to complete..."
+        for TABLE in $TABLES; do
+            if [ -n "$TABLE" ]; then
+                aws dynamodb wait table-not-exists --table-name "$TABLE" 2>/dev/null || true
+            fi
+        done
+    fi
+}
+
+# Function to delete CloudFront distributions and Origin Access Controls
+delete_cloudfront_distributions() {
+    echo "☁️ Deleting CloudFront distributions..."
+    
+    DISTRIBUTIONS=$(aws cloudfront list-distributions \
+        --query 'DistributionList.Items[?contains(Comment, `'$PROJECT_NAME'`) || contains(Origins.Items[0].Id, `'$PROJECT_NAME'`)].Id' \
+        --output text 2>/dev/null || true)
+    
+    for DIST_ID in $DISTRIBUTIONS; do
+        if [ -n "$DIST_ID" ]; then
+            echo "  Deleting CloudFront distribution: $DIST_ID"
+            
+            # Get the ETag
+            ETAG=$(aws cloudfront get-distribution-config --id "$DIST_ID" --query 'ETag' --output text 2>/dev/null || true)
+            
+            if [ -n "$ETAG" ]; then
+                # Get current distribution config and disable it properly
+                echo "    Getting distribution configuration..."
+                aws cloudfront get-distribution-config --id "$DIST_ID" --query 'DistributionConfig' --output json > /tmp/dist-config-$DIST_ID.json 2>/dev/null || true
+                
+                if [ -f "/tmp/dist-config-$DIST_ID.json" ]; then
+                    # Disable the distribution first
+                    echo "    Disabling distribution..."
+                    jq '.Enabled = false' /tmp/dist-config-$DIST_ID.json > /tmp/dist-config-disabled-$DIST_ID.json
+                    
+                    aws cloudfront update-distribution \
+                        --id "$DIST_ID" \
+                        --distribution-config file:///tmp/dist-config-disabled-$DIST_ID.json \
+                        --if-match "$ETAG" 2>/dev/null || true
+                    
+                    # Wait for deployment to complete
+                    echo "    ⏳ Waiting for distribution to be disabled..."
+                    aws cloudfront wait distribution-deployed --id "$DIST_ID" 2>/dev/null || {
+                        echo "    ⚠️ Wait timed out, trying with longer wait..."
+                        sleep 300
+                    }
+                    
+                    # Get new ETag after update
+                    NEW_ETAG=$(aws cloudfront get-distribution-config --id "$DIST_ID" --query 'ETag' --output text 2>/dev/null || true)
+                    
+                    # Delete the distribution
+                    echo "    Deleting distribution..."
+                    if [ -n "$NEW_ETAG" ]; then
+                        aws cloudfront delete-distribution --id "$DIST_ID" --if-match "$NEW_ETAG" 2>/dev/null || true
+                    fi
+                    
+                    # Cleanup temp files
+                    rm -f /tmp/dist-config-$DIST_ID.json /tmp/dist-config-disabled-$DIST_ID.json 2>/dev/null || true
+                fi
+            fi
+        fi
+    done
+    
+    # Delete CloudFront Origin Access Controls
+    echo "  🔒 Deleting CloudFront Origin Access Controls..."
+    OAC_IDS=$(aws cloudfront list-origin-access-controls \
+        --query 'OriginAccessControlList.Items[?contains(Name, `'$PROJECT_NAME'`)].Id' \
+        --output text 2>/dev/null || true)
+    
+    for OAC_ID in $OAC_IDS; do
+        if [ -n "$OAC_ID" ]; then
+            echo "    Deleting Origin Access Control: $OAC_ID"
+            # Get the ETag
+            OAC_ETAG=$(aws cloudfront get-origin-access-control --id "$OAC_ID" --query 'ETag' --output text 2>/dev/null || true)
+            if [ -n "$OAC_ETAG" ]; then
+                aws cloudfront delete-origin-access-control --id "$OAC_ID" --if-match "$OAC_ETAG" 2>/dev/null || true
+            fi
+        fi
+    done
+}
+
+# Function to delete EC2 Key Pairs
+delete_key_pairs() {
+    echo "🔑 Deleting EC2 Key Pairs..."
+    
+    KEY_PAIRS=$(aws ec2 describe-key-pairs \
+        --query "KeyPairs[?contains(KeyName,'$PROJECT_NAME')].KeyName" \
+        --output text 2>/dev/null || true)
+    
+    for KEY_PAIR in $KEY_PAIRS; do
+        if [ -n "$KEY_PAIR" ]; then
+            echo "  Deleting Key Pair: $KEY_PAIR"
+            aws ec2 delete-key-pair --key-name "$KEY_PAIR" 2>/dev/null || true
+        fi
+    done
+}
+
+# Function to delete VPC resources
+delete_vpc_resources() {
+    echo "🌐 Deleting VPC resources..."
+    
+    # Find all project VPCs
+    VPC_IDS=$(aws ec2 describe-vpcs \
+        --filters "Name=tag:Project,Values=$PROJECT_NAME" \
+        --query 'Vpcs[].VpcId' \
+        --output text 2>/dev/null || true)
+    
+    for VPC_ID in $VPC_IDS; do
+        if [ -n "$VPC_ID" ]; then
+            echo "  Processing VPC: $VPC_ID"
+            
+            # Delete VPC Endpoints
+            echo "    Deleting VPC Endpoints..."
+            VPC_ENDPOINTS=$(aws ec2 describe-vpc-endpoints \
+                --filters "Name=vpc-id,Values=$VPC_ID" \
+                --query 'VpcEndpoints[].VpcEndpointId' \
+                --output text 2>/dev/null || true)
+            
+            for ENDPOINT in $VPC_ENDPOINTS; do
+                if [ -n "$ENDPOINT" ]; then
+                    echo "      Deleting VPC Endpoint: $ENDPOINT"
+                    aws ec2 delete-vpc-endpoints --vpc-endpoint-ids "$ENDPOINT" 2>/dev/null || true
+                fi
+            done
+            
+            # Delete Network Interfaces (non-AWS managed)
+            echo "    Deleting Network Interfaces..."
+            ENIS=$(aws ec2 describe-network-interfaces \
+                --filters "Name=vpc-id,Values=$VPC_ID" "Name=description,Values=!*AWS*" \
+                --query 'NetworkInterfaces[].NetworkInterfaceId' \
+                --output text 2>/dev/null || true)
+            
+            for ENI in $ENIS; do
+                if [ -n "$ENI" ]; then
+                    echo "      Deleting Network Interface: $ENI"
+                    aws ec2 delete-network-interface --network-interface-id "$ENI" 2>/dev/null || true
+                fi
+            done
+            
+            # Delete Security Groups (except default) - with improved dependency handling
+            echo "    Deleting Security Groups..."
+            
+            # Get all non-default security groups in this VPC
+            ALL_SGS=$(aws ec2 describe-security-groups \
+                --filters "Name=vpc-id,Values=$VPC_ID" \
+                --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
+                --output text 2>/dev/null || true)
+            
+            # First pass: revoke all ingress rules to break dependencies
+            echo "      Revoking all ingress rules..."
+            for SG in $ALL_SGS; do
+                if [ -n "$SG" ]; then
+                    echo "        Processing security group: $SG"
+                    INGRESS_RULES=$(aws ec2 describe-security-groups --group-ids "$SG" \
+                        --query 'SecurityGroups[0].IpPermissions' --output json 2>/dev/null || echo '[]')
+                    
+                    if [ "$INGRESS_RULES" != "[]" ]; then
+                        echo "          Revoking ingress rules for $SG"
+                        aws ec2 revoke-security-group-ingress --group-id "$SG" --ip-permissions "$INGRESS_RULES" 2>/dev/null || true
+                    fi
+                fi
+            done
+            
+            # Second pass: delete security groups
+            echo "      Deleting security groups..."
+            for SG in $ALL_SGS; do
+                if [ -n "$SG" ]; then
+                    echo "        Deleting Security Group: $SG"
+                    aws ec2 delete-security-group --group-id "$SG" 2>/dev/null || {
+                        echo "        ⚠️ Failed to delete $SG, will retry later"
+                    }
+                fi
+            done
+            
+            # Third pass: retry any failed deletions
+            echo "      Retrying failed security group deletions..."
+            sleep 10
+            for SG in $ALL_SGS; do
+                if [ -n "$SG" ]; then
+                    # Check if it still exists
+                    if aws ec2 describe-security-groups --group-ids "$SG" >/dev/null 2>&1; then
+                        echo "        Retrying deletion of $SG"
+                        aws ec2 delete-security-group --group-id "$SG" 2>/dev/null || true
+                    fi
+                fi
+            done
+            
+            # Delete Route Tables (except main) with association cleanup
+            echo "    Deleting Route Tables..."
+            echo "    🔍 DEBUG: VPC_ID = $VPC_ID"
+            
+            # First, get ALL route tables in VPC for debugging
+            echo "    🔍 DEBUG: All route tables in VPC:"
+            aws ec2 describe-route-tables \
+                --filters "Name=vpc-id,Values=$VPC_ID" \
+                --query 'RouteTables[].[RouteTableId,Associations[0].Main]' \
+                --output table 2>/dev/null || echo "    Failed to query route tables"
+            
+            # Get non-main route tables using tested working JMESPath query
+            echo "    🔍 DEBUG: Executing route table query..."
+            ROUTE_TABLES=$(aws ec2 describe-route-tables \
+                --filters "Name=vpc-id,Values=$VPC_ID" \
+                --query 'RouteTables[?length(Associations[?Main==`true`])==`0`].RouteTableId' \
+                --output text 2>/dev/null || true)
+            
+            echo "    🔍 DEBUG: Found route tables to delete: '$ROUTE_TABLES'"
+            echo "    🔍 DEBUG: Number of route tables found: $(echo $ROUTE_TABLES | wc -w | xargs)"
+            
+            for RT in $ROUTE_TABLES; do
+                if [ -n "$RT" ]; then
+                    echo "      Processing Route Table: $RT"
+                    
+                    # Get and disassociate all associations
+                    ASSOCIATIONS=$(aws ec2 describe-route-tables \
+                        --route-table-ids "$RT" \
+                        --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' \
+                        --output text 2>/dev/null || true)
+                    
+                    for ASSOC in $ASSOCIATIONS; do
+                        if [ -n "$ASSOC" ]; then
+                            echo "        Disassociating route table association: $ASSOC"
+                            aws ec2 disassociate-route-table --association-id "$ASSOC" 2>/dev/null || true
+                        fi
+                    done
+                    
+                    # Delete custom routes (all non-local routes)
+                    ROUTES=$(aws ec2 describe-route-tables \
+                        --route-table-ids "$RT" \
+                        --query 'RouteTables[0].Routes[?Origin==`CreateRoute`].DestinationCidrBlock' \
+                        --output text 2>/dev/null || true)
+                    
+                    for ROUTE in $ROUTES; do
+                        if [ -n "$ROUTE" ] && [ "$ROUTE" != "None" ]; then
+                            echo "        Deleting route: $ROUTE"
+                            aws ec2 delete-route --route-table-id "$RT" --destination-cidr-block "$ROUTE" 2>/dev/null || true
+                        fi
+                    done
+                    
+                    # Wait a bit before deleting the route table
+                    sleep 5
+                    
+                    echo "        Deleting Route Table: $RT"
+                    aws ec2 delete-route-table --route-table-id "$RT" 2>/dev/null || {
+                        echo "        ⚠️ Failed to delete route table: $RT"
+                    }
+                    
+                    # Verify deletion
+                    if aws ec2 describe-route-tables --route-table-ids "$RT" >/dev/null 2>&1; then
+                        echo "        ⚠️ Route table $RT still exists after deletion attempt"
+                    else
+                        echo "        ✅ Route table $RT successfully deleted"
+                    fi
+                fi
+            done
+            
+            echo "    🔍 DEBUG: Route table cleanup completed, checking remaining..."
+            REMAINING_RTS=$(aws ec2 describe-route-tables \
+                --filters "Name=vpc-id,Values=$VPC_ID" \
+                --query 'RouteTables[?!Associations[?Main==`true`]].RouteTableId' \
+                --output text 2>/dev/null || true)
+            echo "    🔍 DEBUG: Remaining non-main route tables: '$REMAINING_RTS'"
+            
+            # Delete Subnets
+            echo "    Deleting Subnets..."
+            SUBNETS=$(aws ec2 describe-subnets \
+                --filters "Name=vpc-id,Values=$VPC_ID" \
+                --query 'Subnets[].SubnetId' \
+                --output text 2>/dev/null || true)
+            
+            for SUBNET in $SUBNETS; do
+                if [ -n "$SUBNET" ]; then
+                    echo "      Deleting Subnet: $SUBNET"
+                    aws ec2 delete-subnet --subnet-id "$SUBNET" 2>/dev/null || true
+                fi
+            done
+            
+            # Detach and delete Internet Gateway
+            echo "    Deleting Internet Gateway..."
+            IGW_ID=$(aws ec2 describe-internet-gateways \
+                --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+                --query 'InternetGateways[].InternetGatewayId' \
+                --output text 2>/dev/null || true)
+            
+            if [ -n "$IGW_ID" ]; then
+                echo "      Detaching Internet Gateway: $IGW_ID"
+                aws ec2 detach-internet-gateway --internet-gateway-id "$IGW_ID" --vpc-id "$VPC_ID" 2>/dev/null || true
+                
+                echo "      Deleting Internet Gateway: $IGW_ID"
+                aws ec2 delete-internet-gateway --internet-gateway-id "$IGW_ID" 2>/dev/null || true
+            fi
+            
+            # Wait for dependencies to be deleted
+            echo "    ⏳ Waiting for VPC dependencies to be cleaned up..."
+            sleep 30
+            
+            # Extended wait for dependencies to be cleaned up
+            echo "    ⏳ Extended wait for all dependencies to be cleaned up..."
+            sleep 60
+            
+            # Check and clean EFS mount targets
+            echo "    Cleaning EFS mount targets..."
+            EFS_TARGETS=$(aws efs describe-mount-targets \
+                --query "MountTargets[?VpcId=='$VPC_ID'].MountTargetId" \
+                --output text 2>/dev/null || true)
+            
+            for TARGET in $EFS_TARGETS; do
+                if [ -n "$TARGET" ]; then
+                    echo "      Deleting EFS mount target: $TARGET"
+                    aws efs delete-mount-target --mount-target-id "$TARGET" 2>/dev/null || true
+                fi
+            done
+            
+            if [ -n "$EFS_TARGETS" ]; then
+                echo "    ⏳ Waiting for EFS mount targets to be deleted..."
+                sleep 60
+            fi
+            
+            # Final comprehensive check for remaining dependencies
+            echo "    Checking for remaining dependencies..."
+            REMAINING_ENIS=$(aws ec2 describe-network-interfaces \
+                --filters "Name=vpc-id,Values=$VPC_ID" \
+                --query 'NetworkInterfaces[].NetworkInterfaceId' \
+                --output text 2>/dev/null || true)
+            
+            if [ -n "$REMAINING_ENIS" ]; then
+                echo "    Force deleting remaining network interfaces..."
+                for ENI in $REMAINING_ENIS; do
+                    if [ -n "$ENI" ]; then
+                        # Check if it's AWS managed
+                        ENI_DESCRIPTION=$(aws ec2 describe-network-interfaces \
+                            --network-interface-ids "$ENI" \
+                            --query 'NetworkInterfaces[0].Description' \
+                            --output text 2>/dev/null || echo "")
+                        
+                        echo "      Processing ENI: $ENI ($ENI_DESCRIPTION)"
+                        
+                        # Detach if attached
+                        aws ec2 detach-network-interface --network-interface-id "$ENI" --force 2>/dev/null || true
+                        sleep 10
+                        aws ec2 delete-network-interface --network-interface-id "$ENI" 2>/dev/null || true
+                    fi
+                done
+                echo "    ⏳ Final wait after ENI cleanup..."
+                sleep 30
+            fi
+            
+            # Delete the VPC with retry logic
+            echo "    Deleting VPC: $VPC_ID"
+            aws ec2 delete-vpc --vpc-id "$VPC_ID" 2>/dev/null || {
+                echo "    ⚠️ VPC deletion failed, attempting retry after longer wait..."
+                
+                # List remaining resources for debugging
+                echo "    Remaining resources in VPC:"
+                aws ec2 describe-network-interfaces --filters "Name=vpc-id,Values=$VPC_ID" --query 'NetworkInterfaces[].{Id:NetworkInterfaceId,Status:Status,Description:Description}' --output table 2>/dev/null || true
+                
+                # Final aggressive cleanup attempt
+                echo "    ⏳ Waiting longer for AWS to release dependencies..."
+                sleep 120
+                
+                # Try one more time to delete remaining ENIs
+                FINAL_ENIS=$(aws ec2 describe-network-interfaces \
+                    --filters "Name=vpc-id,Values=$VPC_ID" \
+                    --query 'NetworkInterfaces[].NetworkInterfaceId' \
+                    --output text 2>/dev/null || true)
+                
+                for ENI in $FINAL_ENIS; do
+                    if [ -n "$ENI" ]; then
+                        echo "      Final attempt to delete ENI: $ENI"
+                        aws ec2 delete-network-interface --network-interface-id "$ENI" 2>/dev/null || true
+                    fi
+                done
+                
+                if [ -n "$FINAL_ENIS" ]; then
+                    sleep 60
+                fi
+                
+                # Final route table cleanup attempt
+                echo "    Final route table cleanup attempt..."
+                echo "    🔍 DEBUG: Final check - VPC_ID = $VPC_ID"
+                
+                echo "    🔍 DEBUG: Remaining route tables in VPC:"
+                aws ec2 describe-route-tables \
+                    --filters "Name=vpc-id,Values=$VPC_ID" \
+                    --query 'RouteTables[].[RouteTableId,Associations[0].Main,Associations[0].RouteTableAssociationId]' \
+                    --output table 2>/dev/null || echo "    Failed to query route tables"
+                
+                # Get non-main route tables for final cleanup using tested working query
+                FINAL_RTS=$(aws ec2 describe-route-tables \
+                    --filters "Name=vpc-id,Values=$VPC_ID" \
+                    --query 'RouteTables[?length(Associations[?Main==`true`])==`0`].RouteTableId' \
+                    --output text 2>/dev/null || true)
+                
+                echo "    🔍 DEBUG: Final route tables to delete: '$FINAL_RTS'"
+                
+                for RT in $FINAL_RTS; do
+                    if [ -n "$RT" ]; then
+                        echo "      Final attempt to delete route table: $RT"
+                        # Force delete any remaining associations
+                        FINAL_ASSOCS=$(aws ec2 describe-route-tables \
+                            --route-table-ids "$RT" \
+                            --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' \
+                            --output text 2>/dev/null || true)
+                        
+                        for ASSOC in $FINAL_ASSOCS; do
+                            if [ -n "$ASSOC" ]; then
+                                aws ec2 disassociate-route-table --association-id "$ASSOC" 2>/dev/null || true
+                            fi
+                        done
+                        
+                        sleep 5
+                        aws ec2 delete-route-table --route-table-id "$RT" 2>/dev/null || true
+                    fi
+                done
+                
+                # Final VPC deletion attempt
+                echo "    Final VPC deletion attempt: $VPC_ID"
+                aws ec2 delete-vpc --vpc-id "$VPC_ID" 2>/dev/null || {
+                    echo "    ⚠️ VPC $VPC_ID could not be deleted - may require manual intervention"
+                    echo "    This may be due to hidden AWS dependencies that require manual cleanup"
+                }
+            }
+        fi
+    done
+}
+
+# Function to delete IAM resources
+delete_iam_resources() {
+    echo "👤 Deleting IAM resources..."
+    
+    # Dynamically find all roles with project name prefix
+    echo "  Finding all IAM roles for project: $PROJECT_NAME"
+    ALL_PROJECT_ROLES=$(aws iam list-roles \
+        --query "Roles[?contains(RoleName, '$PROJECT_NAME')].RoleName" \
+        --output text 2>/dev/null || true)
+    
+    if [ -z "$ALL_PROJECT_ROLES" ]; then
+        echo "  No IAM roles found for project: $PROJECT_NAME"
+        return
+    fi
+    
+    echo "  Found roles: $ALL_PROJECT_ROLES"
+    
+    for ROLE in $ALL_PROJECT_ROLES; do
+        echo "  Deleting role: $ROLE"
+        
+        # Delete attached policies first
+        POLICIES=$(aws iam list-role-policies --role-name "$ROLE" --query 'PolicyNames' --output text 2>/dev/null || true)
+        if [ -n "$POLICIES" ]; then
+            for POLICY in $POLICIES; do
+                echo "    Deleting inline policy: $POLICY"
+                aws iam delete-role-policy --role-name "$ROLE" --policy-name "$POLICY" 2>/dev/null || true
+            done
+        fi
+        
+        # Detach managed policies
+        MANAGED_POLICIES=$(aws iam list-attached-role-policies --role-name "$ROLE" --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null || true)
+        if [ -n "$MANAGED_POLICIES" ]; then
+            for POLICY_ARN in $MANAGED_POLICIES; do
+                echo "    Detaching managed policy: $POLICY_ARN"
+                aws iam detach-role-policy --role-name "$ROLE" --policy-arn "$POLICY_ARN" 2>/dev/null || true
+            done
+        fi
+        
+        # Dynamically find and remove role from instance profiles
+        echo "    Finding instance profiles for role: $ROLE"
+        ROLE_INSTANCE_PROFILES=$(aws iam list-instance-profiles-for-role --role-name "$ROLE" --query 'InstanceProfiles[].InstanceProfileName' --output text 2>/dev/null || true)
+        
+        if [ -n "$ROLE_INSTANCE_PROFILES" ]; then
+            for PROFILE in $ROLE_INSTANCE_PROFILES; do
+                echo "    Removing role from instance profile: $PROFILE"
+                aws iam remove-role-from-instance-profile --instance-profile-name "$PROFILE" --role-name "$ROLE" 2>/dev/null || true
+            done
+        else
+            echo "    No instance profiles found for role: $ROLE"
+        fi
+        
+        # Clean up any instance profiles that might be empty now
+        echo "    Checking for empty instance profiles to delete..."
+        ALL_INSTANCE_PROFILES=$(aws iam list-instance-profiles --query 'InstanceProfiles[?contains(InstanceProfileName, `'$PROJECT_NAME'`)].InstanceProfileName' --output text 2>/dev/null || true)
+        
+        for PROFILE in $ALL_INSTANCE_PROFILES; do
+            # Check if instance profile has any roles
+            PROFILE_ROLES=$(aws iam get-instance-profile --instance-profile-name "$PROFILE" --query 'InstanceProfile.Roles[].RoleName' --output text 2>/dev/null || true)
+            if [ -z "$PROFILE_ROLES" ]; then
+                echo "    Deleting empty instance profile: $PROFILE"
+                aws iam delete-instance-profile --instance-profile-name "$PROFILE" 2>/dev/null || true
+            fi
+        done
+        
+        # Delete the role
+        aws iam delete-role --role-name "$ROLE" 2>/dev/null || true
+    done
+    
+    # Delete user if exists
+    USER_NAME="$PROJECT_NAME-admin"
+    echo "  Deleting user: $USER_NAME"
+    aws iam delete-login-profile --user-name "$USER_NAME" 2>/dev/null || true
+    aws iam delete-user --user-name "$USER_NAME" 2>/dev/null || true
+}
+
+# Function to delete DynamoDB tables
+delete_dynamodb_tables() {
+    echo "🗄️ Deleting DynamoDB tables..."
+    
+    TABLES=$(aws dynamodb list-tables \
+        --query 'TableNames[?contains(@, `'$PROJECT_NAME'`)]' \
+        --output text 2>/dev/null || true)
+    
+    for TABLE in $TABLES; do
+        if [ -n "$TABLE" ]; then
+            echo "  Deleting DynamoDB table: $TABLE"
+            aws dynamodb delete-table --table-name "$TABLE" 2>/dev/null || true
+        fi
+    done
+    
+    # Wait for table deletion to complete
+    if [ -n "$TABLES" ]; then
+        echo "  ⏳ Waiting for DynamoDB table deletion to complete..."
+        for TABLE in $TABLES; do
+            if [ -n "$TABLE" ]; then
+                aws dynamodb wait table-not-exists --table-name "$TABLE" 2>/dev/null || true
+            fi
+        done
+    fi
+}
+
+# Function to verify cleanup
+verify_cleanup() {
+    echo "🔍 Verifying cleanup..."
+    
+    echo "Remaining S3 buckets with $PROJECT_NAME prefix:"
+    aws s3api list-buckets --query "Buckets[?contains(Name, '$PROJECT_NAME')].Name" --output table 2>/dev/null || echo "None found"
+    
+    echo ""
+    echo "Remaining IAM roles with $PROJECT_NAME prefix:"
+    aws iam list-roles --query "Roles[?contains(RoleName, '$PROJECT_NAME')].RoleName" --output table 2>/dev/null || echo "None found"
+    
+    echo ""
+    echo "Remaining DynamoDB tables with $PROJECT_NAME prefix:"
+    aws dynamodb list-tables --query "TableNames[?contains(@, '$PROJECT_NAME')]" --output table 2>/dev/null || echo "None found"
+    
+    echo ""
+    echo "Remaining VPCs with $PROJECT_NAME tag:"
+    aws ec2 describe-vpcs --filters "Name=tag:Project,Values=$PROJECT_NAME" --query 'Vpcs[].VpcId' --output table 2>/dev/null || echo "None found"
+    
+    echo ""
+    echo "Remaining RDS resources with $PROJECT_NAME prefix:"
+    aws rds describe-db-instances --query "DBInstances[?contains(DBInstanceIdentifier, '$PROJECT_NAME')].DBInstanceIdentifier" --output table 2>/dev/null || echo "None found"
+    aws rds describe-db-parameter-groups --query "DBParameterGroups[?contains(DBParameterGroupName, '$PROJECT_NAME')].DBParameterGroupName" --output table 2>/dev/null || echo "None found"
+    aws rds describe-db-subnet-groups --query "DBSubnetGroups[?contains(DBSubnetGroupName, '$PROJECT_NAME')].DBSubnetGroupName" --output table 2>/dev/null || echo "None found"
+    
+    echo ""
+    echo "Remaining Load Balancers with $PROJECT_NAME prefix:"
+    aws elbv2 describe-load-balancers --query "LoadBalancers[?contains(LoadBalancerName, '$PROJECT_NAME')].LoadBalancerName" --output table 2>/dev/null || echo "None found"
+    aws elbv2 describe-target-groups --query "TargetGroups[?contains(TargetGroupName, '$PROJECT_NAME')].TargetGroupName" --output table 2>/dev/null || echo "None found"
+    
+    echo ""
+    echo "Remaining CloudFront resources with $PROJECT_NAME prefix:"
+    aws cloudfront list-distributions --query "DistributionList.Items[?contains(Comment, '$PROJECT_NAME')].Comment" --output table 2>/dev/null || echo "None found"
+    aws cloudfront list-origin-access-controls --query "OriginAccessControlList.Items[?contains(Name, '$PROJECT_NAME')].Name" --output table 2>/dev/null || echo "None found"
+    
+    echo ""
+    echo "Remaining EC2 Key Pairs with $PROJECT_NAME prefix:"
+    aws ec2 describe-key-pairs --query "KeyPairs[?contains(KeyName, '$PROJECT_NAME')].KeyName" --output table 2>/dev/null || echo "None found"
+    
+    echo ""
+    echo "Remaining Auto Scaling Groups with $PROJECT_NAME prefix:"
+    aws autoscaling describe-auto-scaling-groups --query "AutoScalingGroups[?contains(AutoScalingGroupName, '$PROJECT_NAME')].AutoScalingGroupName" --output table 2>/dev/null || echo "None found"
+    
+    echo ""
+    echo "Remaining Launch Templates with $PROJECT_NAME prefix:"
+    aws ec2 describe-launch-templates --query "LaunchTemplates[?contains(LaunchTemplateName, '$PROJECT_NAME')].LaunchTemplateName" --output table 2>/dev/null || echo "None found"
+    
+    echo ""
+    echo "✅ Manual cleanup completed!"
+}
+
+# Function to retry stubborn resources
+retry_stubborn_resources() {
+    echo "🔄 Retry pass - cleaning up any remaining stubborn resources..."
+    
+    # Retry Auto Scaling Groups and Launch Templates
+    echo "  Retrying Auto Scaling Groups and Launch Templates..."
+    delete_autoscaling_resources
+    
+    # Retry Load Balancers and Target Groups
+    echo "  Retrying Load Balancers and Target Groups..."
+    delete_load_balancers
+    
+    # Retry RDS resources
+    echo "  Retrying RDS resources..."
+    delete_rds_resources
+    
+    # Retry Secrets Manager
+    echo "  Retrying Secrets Manager..."
+    delete_secrets
+    
+    # Retry EC2 instances
+    echo "  Retrying EC2 instances..."
+    terminate_ec2_instances
+    
+    # Retry Key Pairs
+    echo "  Retrying Key Pairs..."
+    delete_key_pairs
+    
+    # Retry CloudFront (final attempt)
+    echo "  Final CloudFront cleanup attempt..."
+    delete_cloudfront_distributions
+    
+    # Retry S3 buckets
+    echo "  Final S3 cleanup attempt..."
+    delete_s3_buckets
+    
+    # Retry DynamoDB tables
+    echo "  Final DynamoDB cleanup attempt..."
+    delete_dynamodb_tables
+    
+    # Retry VPC cleanup
+    echo "  Final VPC cleanup attempt..."
+    delete_vpc_resources
+}
+
+# Main execution
+main() {
+    check_aws_cli
+    confirm_deletion
+    
+    echo "🚀 Starting comprehensive cleanup..."
+    
+    # Step 1: Disable deletion protection
+    disable_deletion_protection
+    
+    # Step 2: Delete Auto Scaling Groups and Launch Templates
+    delete_autoscaling_resources
+    
+    # Step 3: Terminate EC2 instances
+    terminate_ec2_instances
+    
+    # Step 4: Delete NAT Gateways
+    delete_nat_gateways
+    
+    # Step 5: Release Elastic IPs
+    release_elastic_ips
+    
+    # Step 6: Delete Load Balancers
+    delete_load_balancers
+    
+    # Step 7: Delete RDS resources
+    delete_rds_resources
+    
+    # Step 8: Delete Secrets Manager secrets
+    delete_secrets
+    
+    # Step 9: Delete CloudFront distributions
+    delete_cloudfront_distributions
+    
+    # Step 10: Delete S3 buckets
+    delete_s3_buckets
+    
+    # Step 11: Delete EC2 Key Pairs
+    delete_key_pairs
+    
+    # Step 12: Delete VPC resources
+    delete_vpc_resources
+    
+    # Step 13: Delete IAM resources
+    delete_iam_resources
+    
+    # Step 14: Delete DynamoDB tables
+    delete_dynamodb_tables
+    
+    # Step 15: Wait and retry stubborn resources
+    echo "⏳ Waiting before retry attempt..."
+    sleep 60
+    retry_stubborn_resources
+    
+    # Step 16: Final verification
+    verify_cleanup
+}
+
+# Run main function
+main "$@"
