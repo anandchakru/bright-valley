@@ -1,0 +1,240 @@
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+resource "aws_iam_role" "ec2_role" {
+  name = "${local.project_name}-${var.environment}-ec2-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  tags = merge(local.common_tags, {
+    Name = "${local.project_name}-${var.environment}-ec2-role"
+  })
+}
+
+resource "aws_iam_role_policy" "ec2_policy" {
+  name = "${local.project_name}-${var.environment}-ec2-policy"
+  role = aws_iam_role.ec2_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          aws_s3_bucket.ops.arn,
+          "${aws_s3_bucket.ops.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = [
+          aws_secretsmanager_secret.app_secrets.arn,
+          "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:${local.project_name}-${var.environment}-secrets*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ssm:GetParameter",
+          "ssm:GetParameters",
+          "ssm:GetParameterHistory",
+          "ssm:DescribeParameters"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "logs:DescribeLogStreams"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ec2_ssm" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ec2_profile" {
+  name = "${local.project_name}-${var.environment}-ec2-profile"
+  role = aws_iam_role.ec2_role.name
+
+  tags = merge(local.common_tags, {
+    Name = "${local.project_name}-${var.environment}-ec2-profile"
+  })
+}
+
+resource "aws_launch_template" "server" {
+  name_prefix   = "${local.project_name}-${var.environment}-"
+  image_id      = data.aws_ami.amazon_linux.id
+  instance_type = var.instance_type
+  key_name      = aws_key_pair.server.key_name
+
+  vpc_security_group_ids = [aws_security_group.ec2.id]
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ec2_profile.name
+  }
+
+  user_data = base64encode(templatefile("${path.module}/user_data.sh", {
+    ops_bucket   = aws_s3_bucket.ops.bucket
+    secret_arn   = aws_secretsmanager_secret.app_secrets.arn
+    environment  = var.environment
+    aws_region   = var.aws_region
+    project_name = local.project_name
+  }))
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = merge(local.common_tags, {
+      Name = "${local.project_name}-${var.environment}-server"
+    })
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.project_name}-${var.environment}-launch-template"
+  })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_autoscaling_group" "server" {
+  name                      = "${local.project_name}-${var.environment}-asg"
+  vpc_zone_identifier       = aws_subnet.private[*].id
+  target_group_arns         = [aws_lb_target_group.server.arn]
+  health_check_type         = "EC2"
+  health_check_grace_period = 300
+
+  min_size         = var.min_size
+  max_size         = var.max_size
+  desired_capacity = var.desired_capacity
+
+  launch_template {
+    id      = aws_launch_template.server.id
+    version = "$Latest"
+  }
+
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 50
+      instance_warmup        = 300
+    }
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "${local.project_name}-${var.environment}-asg"
+    propagate_at_launch = false
+  }
+
+  dynamic "tag" {
+    for_each = local.common_tags
+    content {
+      key                 = tag.key
+      value               = tag.value
+      propagate_at_launch = true
+    }
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_autoscaling_policy" "scale_up" {
+  name                   = "${local.project_name}-${var.environment}-scale-up"
+  scaling_adjustment     = 1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 300
+  autoscaling_group_name = aws_autoscaling_group.server.name
+}
+
+resource "aws_autoscaling_policy" "scale_down" {
+  name                   = "${local.project_name}-${var.environment}-scale-down"
+  scaling_adjustment     = -1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 300
+  autoscaling_group_name = aws_autoscaling_group.server.name
+}
+
+resource "aws_cloudwatch_metric_alarm" "cpu_high" {
+  alarm_name          = "${local.project_name}-${var.environment}-cpu-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "120"
+  statistic           = "Average"
+  threshold           = "80"
+  alarm_description   = "This metric monitors ec2 cpu utilization"
+  alarm_actions       = [aws_autoscaling_policy.scale_up.arn]
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.server.name
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.project_name}-${var.environment}-cpu-high-alarm"
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "cpu_low" {
+  alarm_name          = "${local.project_name}-${var.environment}-cpu-low"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "120"
+  statistic           = "Average"
+  threshold           = "10"
+  alarm_description   = "This metric monitors ec2 cpu utilization"
+  alarm_actions       = [aws_autoscaling_policy.scale_down.arn]
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.server.name
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.project_name}-${var.environment}-cpu-low-alarm"
+  })
+}
