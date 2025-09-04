@@ -1,0 +1,588 @@
+name: Appinfra-030-Apply
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_VERSION: "1.12.2"
+  AWS_REGION: 
+
+jobs:
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    outputs:
+      environment: $
+      tf-plan-exists: $
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Env setup
+        run: |
+          if [[ "$" != "main" && "$" != "dev" ]]; then
+            echo "⚠️ Workflow only supports 'main' or 'dev' branches"
+            echo "Current branch: $"
+            echo "Exiting with no-op"
+            exit 0
+          fi
+          
+          # Set environment variables
+          echo "BRANCH=$" >> $GITHUB_ENV
+          if [ "$" = "main" ]; then
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=test" >> $GITHUB_ENV
+          fi
+          
+          echo "✅ Environment setup completed: $"
+
+      - name: Setup Environment
+        id: setup
+        run: |
+          # Environment is already set in workflow env from branch
+          echo "environment=$" >> $GITHUB_OUTPUT
+          echo "Environment: $"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam:::role/bright-valley-terraform-role
+          aws-region: $
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: $
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        id: init
+        run: |
+          cd ops/terraform
+          echo "🔧 Initializing Terraform..."
+          
+          # Disable exit on error for this specific command
+          set +e
+          INIT_OUTPUT=$(terraform init -backend-config=backend-${ENVIRONMENT}.hcl -input=false 2>&1)
+          INIT_EXIT_CODE=$?
+          set -e
+          
+          echo "$INIT_OUTPUT"
+          
+          if [ $INIT_EXIT_CODE -eq 0 ]; then
+            echo "✅ Terraform init successful"
+          else
+            echo "🚨 Terraform init failed, checking for state corruption..."
+            
+            # Check if it's a state corruption issue
+            if echo "$INIT_OUTPUT" | grep -q "state data in S3 does not have the expected content"; then
+              echo "🛠️ State corruption detected during init, attempting recovery..."
+              
+              # Check if the state file exists in S3
+              echo "🔍 Checking if state file exists in S3..."
+              STATE_BUCKET="bright-valley-terraform-state"
+              STATE_KEY="terraform.tfstate"
+              
+              if aws s3api head-object --bucket "$STATE_BUCKET" --key "$STATE_KEY" 2>/dev/null; then
+                echo "📄 State file exists but is corrupted, attempting repair..."
+                
+                # Try to download and inspect the state file
+                aws s3 cp "s3://$STATE_BUCKET/$STATE_KEY" ./corrupted_state.tfstate 2>/dev/null || true
+                
+                # Try init with reconfigure to bypass corrupted state
+                echo "🔄 Trying init with -reconfigure..."
+                set +e
+                terraform init -reconfigure -input=false
+                RECONFIGURE_EXIT_CODE=$?
+                set -e
+                
+                if [ $RECONFIGURE_EXIT_CODE -ne 0 ]; then
+                  echo "🆘 Reconfigure failed, removing corrupted state file..."
+                  aws s3 rm "s3://$STATE_BUCKET/$STATE_KEY" || true
+                  
+                  # Try init again with fresh state
+                  echo "🔄 Trying init with fresh state..."
+                  terraform init -backend-config=backend-${ENVIRONMENT}.hcl -input=false
+                fi
+              else
+                echo "📄 No state file found - this appears to be a fresh deployment"
+                echo "🔄 Trying init with fresh state..."
+                
+                # No state file exists, so this should work
+                set +e
+                terraform init -backend-config=backend-${ENVIRONMENT}.hcl -input=false
+                FRESH_INIT_EXIT_CODE=$?
+                set -e
+                
+                if [ $FRESH_INIT_EXIT_CODE -ne 0 ]; then
+                  echo "❌ Fresh init failed - there may be a backend configuration issue"
+                  exit 1
+                fi
+              fi
+            else
+              echo "❌ Init failed for unknown reason:"
+              echo "$INIT_OUTPUT"
+              exit 1
+            fi
+          fi
+        
+      - name: Terraform Validate
+        id: validate
+        run: |
+          cd ops/terraform
+          terraform validate -no-color
+
+      - name: Check and Generate SSH Keys
+        run: |
+          echo "🔑 Checking SSH keys for environment: ${ENVIRONMENT}..."
+          
+          STATE_BUCKET="bright-valley-terraform-state"
+          PRIVATE_KEY="ssh/${ENVIRONMENT}_key"
+          PUBLIC_KEY="ssh/${ENVIRONMENT}_key.pub"
+          
+          # Check if SSH keys exist in S3
+          PRIVATE_EXISTS=$(aws s3api head-object --bucket "$STATE_BUCKET" --key "$PRIVATE_KEY" >/dev/null 2>&1 && echo "true" || echo "false")
+          PUBLIC_EXISTS=$(aws s3api head-object --bucket "$STATE_BUCKET" --key "$PUBLIC_KEY" >/dev/null 2>&1 && echo "true" || echo "false")
+          
+          if [ "$PRIVATE_EXISTS" = "true" ] && [ "$PUBLIC_EXISTS" = "true" ]; then
+            echo "✅ SSH keys already exist for ${ENVIRONMENT} environment"
+          else
+            echo "🔑 SSH keys missing for ${ENVIRONMENT} environment, generating new ones..."
+            
+            # Create temporary directory for key generation
+            TEMP_DIR=$(mktemp -d)
+            cd "$TEMP_DIR"
+            
+            # Generate SSH key pair
+            echo "🔑 Generating SSH key pair for ${ENVIRONMENT} environment..."
+            ssh-keygen -t rsa -b 4096 -f "${ENVIRONMENT}_key" -N "" -C "bright-valley-${ENVIRONMENT}"
+            
+            echo "✅ Generated ${ENVIRONMENT}_key and ${ENVIRONMENT}_key.pub"
+            
+            # Upload to S3
+            echo "📤 Uploading ${ENVIRONMENT} SSH keys to S3..."
+            aws s3 cp "${ENVIRONMENT}_key" "s3://$STATE_BUCKET/ssh/${ENVIRONMENT}_key"
+            aws s3 cp "${ENVIRONMENT}_key.pub" "s3://$STATE_BUCKET/ssh/${ENVIRONMENT}_key.pub"
+            
+            echo "✅ Uploaded SSH keys to s3://$STATE_BUCKET/ssh/"
+            
+            # Cleanup temporary directory
+            cd /
+            rm -rf "$TEMP_DIR"
+            echo "🧹 Cleaned up temporary files"
+          fi
+          
+          echo "🔍 Verifying SSH keys in S3:"
+          aws s3 ls "s3://$STATE_BUCKET/ssh/" | grep "${ENVIRONMENT}_key" || echo "⚠️ Keys may not be visible yet"
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd ops/terraform
+          echo "🗓️ Running Terraform plan..."
+          
+          # Build plan command
+          PLAN_CMD="terraform plan -var-file=\"environments/$.tfvars\" -out=tfplan-$ -no-color -input=false"
+          
+          echo "Executing: $PLAN_CMD"
+          eval $PLAN_CMD || {
+            echo "🔄 First plan attempt failed, retrying with safety flags..."
+            terraform plan \
+              -var-file="environments/$.tfvars" \
+              -out=tfplan-$ \
+              -no-color \
+              -input=false \
+              -refresh=false || {
+              echo "❌ Plan failed after retry."
+              exit 1
+            }
+          }
+          
+          # Show plan summary
+          terraform show -no-color tfplan-$
+        continue-on-error: true
+
+
+      - name: Upload Terraform Plan
+        if: steps.plan.outputs.exitcode == 0
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-$
+          path: ops/terraform/tfplan-$
+          retention-days: 1
+
+      - name: Plan Status
+        if: steps.plan.outputs.exitcode == 1
+        run: exit 1
+
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: plan
+    environment: $
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Env setup
+        run: |
+          if [[ "$" != "main" && "$" != "dev" ]]; then
+            echo "⚠️ Workflow only supports 'main' or 'dev' branches"
+            echo "Current branch: $"
+            echo "Exiting with no-op"
+            exit 0
+          fi
+          
+          # Set environment variables
+          echo "BRANCH=$" >> $GITHUB_ENV
+          if [ "$" = "main" ]; then
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=test" >> $GITHUB_ENV
+          fi
+          
+          echo "✅ Environment setup completed: $"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam:::role/bright-valley-terraform-role
+          aws-region: $
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: $
+          terraform_wrapper: false
+
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-$
+          path: ops/terraform/
+
+      - name: Check and Generate SSH Keys
+        run: |
+          echo "🔑 Checking SSH keys for environment: ${ENVIRONMENT}..."
+          
+          STATE_BUCKET="bright-valley-terraform-state"
+          PRIVATE_KEY="ssh/${ENVIRONMENT}_key"
+          PUBLIC_KEY="ssh/${ENVIRONMENT}_key.pub"
+          
+          # Check if SSH keys exist in S3
+          PRIVATE_EXISTS=$(aws s3api head-object --bucket "$STATE_BUCKET" --key "$PRIVATE_KEY" >/dev/null 2>&1 && echo "true" || echo "false")
+          PUBLIC_EXISTS=$(aws s3api head-object --bucket "$STATE_BUCKET" --key "$PUBLIC_KEY" >/dev/null 2>&1 && echo "true" || echo "false")
+          
+          if [ "$PRIVATE_EXISTS" = "true" ] && [ "$PUBLIC_EXISTS" = "true" ]; then
+            echo "✅ SSH keys already exist for ${ENVIRONMENT} environment"
+          else
+            echo "🔑 SSH keys missing for ${ENVIRONMENT} environment, generating new ones..."
+            
+            # Create temporary directory for key generation
+            TEMP_DIR=$(mktemp -d)
+            cd "$TEMP_DIR"
+            
+            # Generate SSH key pair
+            echo "🔑 Generating SSH key pair for ${ENVIRONMENT} environment..."
+            ssh-keygen -t rsa -b 4096 -f "${ENVIRONMENT}_key" -N "" -C "bright-valley-${ENVIRONMENT}"
+            
+            echo "✅ Generated ${ENVIRONMENT}_key and ${ENVIRONMENT}_key.pub"
+            
+            # Upload to S3
+            echo "📤 Uploading ${ENVIRONMENT} SSH keys to S3..."
+            aws s3 cp "${ENVIRONMENT}_key" "s3://$STATE_BUCKET/ssh/${ENVIRONMENT}_key"
+            aws s3 cp "${ENVIRONMENT}_key.pub" "s3://$STATE_BUCKET/ssh/${ENVIRONMENT}_key.pub"
+            
+            echo "✅ Uploaded SSH keys to s3://$STATE_BUCKET/ssh/"
+            
+            # Cleanup temporary directory
+            cd /
+            rm -rf "$TEMP_DIR"
+            echo "🧹 Cleaned up temporary files"
+          fi
+          
+          echo "🔍 Verifying SSH keys in S3:"
+          aws s3 ls "s3://$STATE_BUCKET/ssh/" | grep "${ENVIRONMENT}_key" || echo "⚠️ Keys may not be visible yet"
+
+      - name: Check for SSL Certificate
+        run: |
+          echo "🔍 Checking for existing SSL certificate..."
+          
+          # Domain construction with environment-specific prefix
+          if [ "${ENVIRONMENT}" = "prod" ]; then
+            UI_DOMAIN="bright-valley-ui.."
+          else
+            UI_DOMAIN="bright-valley-${ENVIRONMENT}-ui.."
+          fi
+          
+          # Check if certificate exists and is validated
+          CERT_ARN=$(aws acm list-certificates --region us-east-1 \
+            --query "CertificateSummaryList[?DomainName=='$UI_DOMAIN'].CertificateArn" --output text)
+          
+          if [ -n "$CERT_ARN" ] && [ "$CERT_ARN" != "None" ]; then
+            echo "✅ Found certificate: $CERT_ARN"
+            
+            # Check certificate status
+            CERT_STATUS=$(aws acm describe-certificate --region us-east-1 --certificate-arn "$CERT_ARN" \
+              --query 'Certificate.Status' --output text)
+            echo "📋 Certificate status: $CERT_STATUS"
+            
+            if [ "$CERT_STATUS" = "PENDING_VALIDATION" ]; then
+              echo "⚠️  Certificate is pending DNS validation!"
+              echo "🔍 Required DNS records:"
+              aws acm describe-certificate --region us-east-1 --certificate-arn "$CERT_ARN" \
+                --query 'Certificate.DomainValidationOptions[]' --output json | \
+                jq -r '.[] | "Domain: \(.DomainName)\nCNAME: \(.ResourceRecord.Name) → \(.ResourceRecord.Value)\n"'
+              echo "💡 Add these CNAME records to your DNS provider to validate the certificate"
+            elif [ "$CERT_STATUS" = "ISSUED" ]; then
+              echo "✅ Certificate is validated and ready to use!"
+            fi
+            
+            # Update tfvars with certificate ARN
+            echo "📝 Updating tfvars with certificate ARN..."
+            sed -i "s|certificate_arn = \"\"| certificate_arn = \"$CERT_ARN\"|g" "ops/terraform/environments/$.tfvars"
+            
+            echo "✅ Certificate ARN set in tfvars"
+          else
+            echo "⚠️ No certificate found - will use CloudFront default certificate"
+          fi
+
+      - name: Terraform Init
+        run: |
+          cd ops/terraform
+          echo "🔧 Initializing Terraform..."
+          
+          # Disable exit on error for this specific command
+          set +e
+          INIT_OUTPUT=$(terraform init -backend-config=backend-${ENVIRONMENT}.hcl -input=false 2>&1)
+          INIT_EXIT_CODE=$?
+          set -e
+          
+          echo "$INIT_OUTPUT"
+          
+          if [ $INIT_EXIT_CODE -eq 0 ]; then
+            echo "✅ Terraform init successful"
+          else
+            echo "🚨 Terraform init failed, checking for state corruption..."
+            
+            # Check if it's a state corruption issue
+            if echo "$INIT_OUTPUT" | grep -q "state data in S3 does not have the expected content"; then
+              echo "🛠️ State corruption detected during init, attempting recovery..."
+              
+              # Check if the state file exists in S3
+              echo "🔍 Checking if state file exists in S3..."
+              STATE_BUCKET="bright-valley-terraform-state"
+              STATE_KEY="terraform.tfstate"
+              
+              if aws s3api head-object --bucket "$STATE_BUCKET" --key "$STATE_KEY" 2>/dev/null; then
+                echo "📄 State file exists but is corrupted, attempting repair..."
+                
+                # Try init with reconfigure to bypass corrupted state
+                echo "🔄 Trying init with -reconfigure..."
+                set +e
+                terraform init -reconfigure -input=false
+                RECONFIGURE_EXIT_CODE=$?
+                set -e
+                
+                if [ $RECONFIGURE_EXIT_CODE -ne 0 ]; then
+                  echo "🆘 Reconfigure failed, removing corrupted state file..."
+                  aws s3 rm "s3://$STATE_BUCKET/$STATE_KEY" || true
+                  
+                  # Try init again with fresh state
+                  echo "🔄 Trying init with fresh state..."
+                  terraform init -backend-config=backend-${ENVIRONMENT}.hcl -input=false
+                fi
+              else
+                echo "📄 No state file found - this appears to be a fresh deployment"
+                echo "🔄 Trying init with fresh state..."
+                
+                # No state file exists, so this should work
+                set +e
+                terraform init -backend-config=backend-${ENVIRONMENT}.hcl -input=false
+                FRESH_INIT_EXIT_CODE=$?
+                set -e
+                
+                if [ $FRESH_INIT_EXIT_CODE -ne 0 ]; then
+                  echo "❌ Fresh init failed - there may be a backend configuration issue"
+                  exit 1
+                fi
+              fi
+            else
+              echo "❌ Init failed for unknown reason:"
+              echo "$INIT_OUTPUT"
+              exit 1
+            fi
+          fi
+
+      - name: Terraform Apply
+        id: apply
+        run: |
+          cd ops/terraform
+          echo "🚀 Running Terraform Apply..."
+          
+          # Apply terraform with error handling
+          set +e
+          APPLY_OUTPUT=$(terraform apply -input=false -auto-approve tfplan-$ 2>&1)
+          APPLY_EXIT_CODE=$?
+          set -e
+          
+          echo "$APPLY_OUTPUT"
+          
+          if [ $APPLY_EXIT_CODE -eq 0 ]; then
+            echo "✅ Terraform apply completed successfully!"
+            echo "apply_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "🚨 Terraform apply failed!"
+            echo "apply_success=false" >> $GITHUB_OUTPUT
+            
+            # Check if this is a partial failure that requires cleanup
+            if echo "$APPLY_OUTPUT" | grep -q "Error: "; then
+              echo "⚠️ Partial deployment detected - resources may need cleanup"
+              echo "partial_deployment=true" >> $GITHUB_OUTPUT
+            fi
+            
+            exit 1
+          fi
+
+      - name: Get Terraform Outputs
+        id: outputs
+        if: steps.apply.outputs.apply_success == 'true'
+        run: |
+          cd ops/terraform
+          echo "📋 Extracting terraform outputs..."
+          
+          # Safely extract outputs with error handling
+          set +e
+          S3_BUCKET=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "")
+          CLOUDFRONT_ID=$(terraform output -raw cloudfront_distribution_id 2>/dev/null || echo "")
+          CLOUDFRONT_DOMAIN=$(terraform output -raw cloudfront_domain_name 2>/dev/null || echo "")
+          ALB_DNS=$(terraform output -raw load_balancer_dns_name 2>/dev/null || echo "")
+          OPS_BUCKET=$(terraform output -raw ops_bucket_name 2>/dev/null || echo "")
+          ASG_NAME=$(terraform output -raw autoscaling_group_name 2>/dev/null || echo "")
+          UI_DOMAIN=$(terraform output -raw ui_domain 2>/dev/null || echo "")
+          set -e
+          
+          # Set outputs with fallbacks
+          echo "s3_bucket_name=${S3_BUCKET:-not-available}" >> $GITHUB_OUTPUT
+          echo "cloudfront_distribution_id=${CLOUDFRONT_ID:-not-available}" >> $GITHUB_OUTPUT
+          echo "cloudfront_domain_name=${CLOUDFRONT_DOMAIN:-not-available}" >> $GITHUB_OUTPUT
+          echo "load_balancer_dns_name=${ALB_DNS:-not-available}" >> $GITHUB_OUTPUT
+          echo "ops_bucket_name=${OPS_BUCKET:-not-available}" >> $GITHUB_OUTPUT
+          echo "autoscaling_group_name=${ASG_NAME:-not-available}" >> $GITHUB_OUTPUT
+          echo "ui_domain=${UI_DOMAIN:-not-available}" >> $GITHUB_OUTPUT
+          
+          echo "✅ Terraform outputs extracted successfully"
+
+      - name: Display SSL Certificate Validation Info
+        continue-on-error: true
+        run: |
+          cd ops/terraform
+          echo "🌐 UI Domain Configuration:"
+          echo "  UI Domain: $(terraform output -raw ui_domain)"
+          echo "  CloudFront Domain: $(terraform output -raw cloudfront_domain_name)"
+          
+          CERT_ARN=$(terraform output -raw certificate_arn)
+          if [ "$CERT_ARN" != "none" ]; then
+            echo ""
+            echo "🔐 SSL Certificate Configuration:"
+            echo "Certificate ARN: $CERT_ARN"
+            
+            # Check certificate status
+            CERT_STATUS=$(aws acm describe-certificate --certificate-arn "$CERT_ARN" --region us-east-1 \
+              --query 'Certificate.Status' --output text 2>/dev/null || echo "UNKNOWN")
+            echo "Certificate Status: $CERT_STATUS"
+            
+            if [ "$CERT_STATUS" = "PENDING_VALIDATION" ]; then
+              echo ""
+              echo "⚠️  Certificate needs DNS validation!"
+              echo "Add these CNAME records to your DNS provider:"
+              aws acm describe-certificate --certificate-arn "$CERT_ARN" --region us-east-1 \
+                --query 'Certificate.DomainValidationOptions[]' --output json | \
+                jq -r '.[] | "Domain: \(.DomainName)\nCNAME: \(.ResourceRecord.Name) → \(.ResourceRecord.Value)\n"'
+            elif [ "$CERT_STATUS" = "ISSUED" ]; then
+              echo "✅ Certificate is validated and active!"
+            fi
+          else
+            echo "✅ Using CloudFront default certificate"
+          fi
+
+      - name: Copy EC2 Setup Scripts to S3
+        continue-on-error: true
+        run: |
+          echo "📋 Copying EC2 setup scripts to S3..."
+          OPS_BUCKET="$"
+          
+          if [ -z "$OPS_BUCKET" ] || [ "$OPS_BUCKET" = "not-available" ]; then
+            echo "❌ Could not get ops bucket name from Terraform outputs - skipping script upload"
+            echo "⚠️ EC2 setup scripts not uploaded - manual upload may be required"
+            exit 0
+          fi
+          
+          echo "📁 Copying ops/ec2-setup/ directory to s3://${OPS_BUCKET}/ec2-setup/"
+          aws s3 cp ops/ec2-setup/ "s3://${OPS_BUCKET}/ec2-setup/" --recursive --region $
+          
+          echo "✅ EC2 setup scripts copied to S3 successfully"
+          echo "🔍 Verifying uploaded files:"
+          aws s3 ls "s3://${OPS_BUCKET}/ec2-setup/" --region $
+
+      - name: Deployment Summary
+        if: always()
+        run: |
+          # Check if deployment was successful
+          if [ "$" = "success" ] && [ "$" = "true" ]; then
+            echo "## 🎉 Deployment Successful!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Environment:** $" >> $GITHUB_STEP_SUMMARY
+            echo "**Branch:** $" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🔑 Key Infrastructure Details:" >> $GITHUB_STEP_SUMMARY
+            echo "- **UI Domain:** $" >> $GITHUB_STEP_SUMMARY
+            echo "- **CloudFront Domain:** $" >> $GITHUB_STEP_SUMMARY
+            echo "- **Load Balancer DNS:** $" >> $GITHUB_STEP_SUMMARY
+            echo "- **S3 Client Bucket:** $" >> $GITHUB_STEP_SUMMARY
+            echo "- **Ops Bucket:** $" >> $GITHUB_STEP_SUMMARY
+            echo "- **Auto Scaling Group:** $" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🚀 Next Steps:" >> $GITHUB_STEP_SUMMARY
+            echo "1. Verify SSL certificate DNS validation if needed" >> $GITHUB_STEP_SUMMARY
+            echo "2. Test application functionality" >> $GITHUB_STEP_SUMMARY
+            echo "3. Monitor infrastructure health" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Infrastructure is ready for use! 🎯" >> $GITHUB_STEP_SUMMARY
+          elif [ "$" = "true" ]; then
+            echo "## ⚠️ Partial Deployment Detected" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Environment:** $" >> $GITHUB_STEP_SUMMARY
+            echo "**Branch:** $" >> $GITHUB_STEP_SUMMARY
+            echo "**Status:** Some resources may have been created" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🚨 IMMEDIATE ACTION REQUIRED:" >> $GITHUB_STEP_SUMMARY
+            echo "1. **Run the Destruct-400-nuke workflow IMMEDIATELY** to clean up partial resources" >> $GITHUB_STEP_SUMMARY
+            echo "2. Check AWS console for any created resources that need manual cleanup" >> $GITHUB_STEP_SUMMARY
+            echo "3. Review the terraform apply logs for the specific failure reason" >> $GITHUB_STEP_SUMMARY
+            echo "4. Fix the underlying issue before attempting deployment again" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **WARNING:** Leaving partial resources may incur AWS costs" >> $GITHUB_STEP_SUMMARY
+            echo "🔗 [Run Nuke Workflow](../../actions/workflows/Destruct-400-nuke.yml)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Environment:** $" >> $GITHUB_STEP_SUMMARY
+            echo "**Branch:** $" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🔧 Troubleshooting:" >> $GITHUB_STEP_SUMMARY
+            echo "1. Check the workflow logs for specific error details" >> $GITHUB_STEP_SUMMARY
+            echo "2. Verify AWS credentials and permissions" >> $GITHUB_STEP_SUMMARY
+            echo "3. Check terraform state consistency" >> $GITHUB_STEP_SUMMARY
+            echo "4. Run bootstrap workflow if this is first deployment" >> $GITHUB_STEP_SUMMARY
+            echo "5. Consider running nuke workflow if any resources were partially created" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "💡 For complete cleanup, use the Destruct-400-nuke workflow" >> $GITHUB_STEP_SUMMARY
+          fi
